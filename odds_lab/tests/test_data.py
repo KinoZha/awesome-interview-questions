@@ -314,7 +314,8 @@ def test_thetadata_missing_required_field_raises_clear_error():
         "header": {"format": ["root", "expiration", "right", "date", "bid", "ask"]},  # no 'strike'
         "response": [["SPY", 20150130, "C", 20150105, 5.0, 5.2]],
     }
-    provider._get = _make_fake_get(bad_payload, {"header": {"format": []}, "response": []}, _stock_eod_payload())
+    empty_but_valid_greeks = {"header": {"format": ["strike", "right"]}, "response": []}
+    provider._get = _make_fake_get(bad_payload, empty_but_valid_greeks, _stock_eod_payload())
     with pytest.raises(td.ThetaError) as exc_info:
         provider.chain_eod("SPY", date(2015, 1, 5), date(2015, 1, 30))
     msg = str(exc_info.value)

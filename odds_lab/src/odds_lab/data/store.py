@@ -24,6 +24,7 @@ where `asof` is itself the last permitted date.
 from __future__ import annotations
 
 from datetime import date
+from collections.abc import Sequence
 from pathlib import Path
 
 import duckdb
@@ -160,6 +161,34 @@ class ChainStore:
         if df.empty:
             return []
         return [d.date() for d in pd.to_datetime(df["date"]).tolist()]
+
+    def contains_synthetic(self, roots: Sequence[str] | None = None) -> bool:
+        """True if any stored chain row is flagged synthetic.
+
+        The run manifest must reflect the data actually consumed, not what the config
+        asked for: a backtest pointed at a synthetic store via --store with the parquet
+        provider would otherwise report real data and render no warning banner.
+        """
+        chains_dir = self.root / "chains"
+        if not chains_dir.exists():
+            return False
+        wanted = set(roots) if roots else None
+        for d in sorted(chains_dir.iterdir()):
+            if not d.is_dir() or not d.name.startswith("underlying="):
+                continue
+            r = d.name.split("=", 1)[1]
+            if wanted is not None and r not in wanted:
+                continue
+            pattern = str(d / "year=*" / "month=*" / "part.parquet")
+            try:
+                got = self._con.execute(
+                    f"SELECT bool_or(is_synthetic) FROM read_parquet('{pattern}')"
+                ).fetchone()
+            except Exception:
+                continue
+            if got and got[0]:
+                return True
+        return False
 
     def coverage(self) -> pd.DataFrame:
         """One row per root with parquet chain data: min/max quote_date, row count,

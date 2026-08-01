@@ -291,14 +291,28 @@ def fig_trade_lifecycle(result: "BacktestResult", position_id: str, store=None) 
         return _empty_fig(title, f"no daily snapshots recorded for '{position_id}'")
 
     strategy = str(trow["strategy"])
-    # The schema stores one short_strike/long_strike pair per position; for two-sided
-    # structures (iron_condor/short_strangle) that pair is taken to be the put side by
-    # convention here -- a known simplification, see report/figures.py docstring.
-    direction_up = "call" in strategy
-    short_k = float(trow["short_strike"])
-    long_k = trow["long_strike"]
-    has_long = bool(pd.notna(long_k))
-    long_k = float(long_k) if has_long else None
+
+    def _k(col: str) -> float | None:
+        v = trow.get(col)
+        return float(v) if pd.notna(v) else None
+
+    # Draw every side the structure actually has. A two-sided structure (iron condor,
+    # short strangle) has a loss zone below the short put AND above the short call;
+    # showing only one of them would hide half the risk on exactly the trades where
+    # the risk matters most.
+    sides: list[dict] = []
+    sp, lp = _k("short_put_strike"), _k("long_put_strike")
+    sc, lc = _k("short_call_strike"), _k("long_call_strike")
+    if sp is not None:
+        sides.append({"short": sp, "long": lp, "up": False, "label": "put"})
+    if sc is not None:
+        sides.append({"short": sc, "long": lc, "up": True, "label": "call"})
+    if not sides:  # single-sided legacy rows without the per-side columns populated
+        sk = _k("short_strike")
+        if sk is None:
+            return _empty_fig(title, f"trade '{position_id}' has no strike recorded")
+        sides.append({"short": sk, "long": _k("long_strike"), "up": "call" in strategy,
+                      "label": "call" if "call" in strategy else "put"})
 
     fig = make_subplots(
         rows=2,
@@ -315,26 +329,27 @@ def fig_trade_lifecycle(result: "BacktestResult", position_id: str, store=None) 
 
     x = tsnaps["date"]
     price = tsnaps["underlying_price"]
-    band_vals = [v for v in (short_k, long_k) if v is not None]
+    band_vals = [v for side in sides for v in (side["short"], side["long"]) if v is not None]
     y_lo = float(min(price.min(), *band_vals)) * 0.985
     y_hi = float(max(price.max(), *band_vals)) * 1.015
 
-    if direction_up:
-        loss_band = (short_k, y_hi)
-        safe_band = (y_lo, short_k)
-    else:
-        loss_band = (y_lo, short_k)
-        safe_band = (short_k, y_hi)
-    fig.add_hrect(y0=loss_band[0], y1=loss_band[1], fillcolor=COLORS["negative"], opacity=0.10,
-                  line_width=0, row=1, col=1)
-    fig.add_hrect(y0=safe_band[0], y1=safe_band[1], fillcolor=COLORS["positive"], opacity=0.05,
-                  line_width=0, row=1, col=1)
-
-    fig.add_hline(y=short_k, line=dict(color=COLORS["short_strike"], width=1.5, dash="dash"),
-                  annotation_text=f"short {short_k:g}", annotation_position="right", row=1, col=1)
-    if has_long:
-        fig.add_hline(y=long_k, line=dict(color=COLORS["long_strike"], width=1.5, dash="dot"),
-                      annotation_text=f"long {long_k:g}", annotation_position="right", row=1, col=1)
+    # Profit zone = between the short strikes (or on the safe side of the only one).
+    lo_edge = max([s["short"] for s in sides if not s["up"]], default=y_lo)
+    hi_edge = min([s["short"] for s in sides if s["up"]], default=y_hi)
+    if hi_edge > lo_edge:
+        fig.add_hrect(y0=lo_edge, y1=hi_edge, fillcolor=COLORS["positive"], opacity=0.05,
+                      line_width=0, row=1, col=1)
+    for side in sides:
+        lo, hi = (side["short"], y_hi) if side["up"] else (y_lo, side["short"])
+        fig.add_hrect(y0=lo, y1=hi, fillcolor=COLORS["negative"], opacity=0.10,
+                      line_width=0, row=1, col=1)
+        fig.add_hline(y=side["short"], line=dict(color=COLORS["short_strike"], width=1.5, dash="dash"),
+                      annotation_text=f"short {side['label']} {side['short']:g}",
+                      annotation_position="right", row=1, col=1)
+        if side["long"] is not None:
+            fig.add_hline(y=side["long"], line=dict(color=COLORS["long_strike"], width=1.5, dash="dot"),
+                          annotation_text=f"long {side['label']} {side['long']:g}",
+                          annotation_position="right", row=1, col=1)
 
     fig.add_trace(
         go.Scatter(x=x, y=price, mode="lines", name="Underlying", line=dict(color=COLORS["text"], width=2.2)),

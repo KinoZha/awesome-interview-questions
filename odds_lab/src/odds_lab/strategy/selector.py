@@ -287,8 +287,11 @@ def _compute_edge(
             long_strike=strikes["long_call"], right="C", S=S, T_years=T_years, iv=iv_c,
             r=r, q=q, dist=dist, with_ci=False,
         )
-        # Judgement call: treat the two sides as independent and sum probabilities/EV.
-        # Slightly overstates tail risk (double-touch is not possible) but is conservative.
+        # Summing the two sides is EXACT here, not an approximation. The loss-onset
+        # events {S_T < short_put} and {S_T > short_call} are mutually exclusive, so the
+        # probabilities add; the EVs add by linearity of expectation. The even credit/2
+        # split between the sides is arbitrary (index skew puts most of the credit on the
+        # put side) but cancels in the sum, and neither probability depends on it.
         return {
             "p_theo_loss": put_er.p_theo_loss + call_er.p_theo_loss,
             "p_actual_loss": put_er.p_actual_loss + call_er.p_actual_loss,

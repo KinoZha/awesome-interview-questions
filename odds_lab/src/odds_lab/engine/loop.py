@@ -131,7 +131,12 @@ def _trade_row(pos: Position) -> dict:
     short_strike = next((l.strike for l in pos.legs if l.ratio < 0), float("nan"))
     long_strike = next((l.strike for l in pos.legs if l.ratio > 0), float("nan"))
 
+    def _strike(side: list, short: bool) -> float:
+        want = (lambda x: x.ratio < 0) if short else (lambda x: x.ratio > 0)
+        return next((l.strike for l in side if want(l)), float("nan"))
+
     attrib = pos.meta.get("_attrib_totals", {})
+    notional = pos.qty * CONTRACT_MULTIPLIER
 
     return {
         "position_id": pos.position_id,
@@ -145,6 +150,10 @@ def _trade_row(pos: Position) -> dict:
         "short_strike": short_strike,
         "long_strike": long_strike,
         "width": abs(short_strike - long_strike) if (put_legs or call_legs) and not math.isnan(long_strike) else float("nan"),
+        "short_put_strike": _strike(put_legs, short=True),
+        "long_put_strike": _strike(put_legs, short=False),
+        "short_call_strike": _strike(call_legs, short=True),
+        "long_call_strike": _strike(call_legs, short=False),
         "entry_credit": pos.entry_credit,
         "exit_debit": exit_debit,
         "max_loss": pos.max_loss,
@@ -166,11 +175,14 @@ def _trade_row(pos: Position) -> dict:
         "edge_ev": pos.meta.get("edge_ev", float("nan")),
         "underlying_entry": pos.meta.get("underlying_entry", float("nan")),
         "underlying_exit": pos.meta.get("_underlying_exit", float("nan")),
-        "pnl_delta": attrib.get("d_delta", 0.0),
-        "pnl_gamma": attrib.get("d_gamma", 0.0),
-        "pnl_vega": attrib.get("d_vega", 0.0),
-        "pnl_theta": attrib.get("d_theta", 0.0),
-        "pnl_residual": attrib.get("d_residual", 0.0),
+        # Snapshot attribution accumulates in dollars-per-share; `pnl` on this row is
+        # position dollars. Scale so the attribution stack is comparable with P&L
+        # instead of being three orders of magnitude smaller than it.
+        "pnl_delta": attrib.get("d_delta", 0.0) * notional,
+        "pnl_gamma": attrib.get("d_gamma", 0.0) * notional,
+        "pnl_vega": attrib.get("d_vega", 0.0) * notional,
+        "pnl_theta": attrib.get("d_theta", 0.0) * notional,
+        "pnl_residual": attrib.get("d_residual", 0.0) * notional,
     }
 
 
@@ -436,7 +448,11 @@ def run_backtest(cfg: BacktestConfig, store) -> BacktestResult:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "data_source": cfg.data.provider,
         "coverage": coverage,
-        "is_synthetic": cfg.data.provider == "synthetic" or cfg.data.allow_synthetic,
+        "is_synthetic": (
+            cfg.data.provider == "synthetic"
+            or cfg.data.allow_synthetic
+            or store.contains_synthetic(cfg.roots)
+        ),
         "rejected_trades": portfolio.rejected_trades,
         "warnings": warnings,
     }

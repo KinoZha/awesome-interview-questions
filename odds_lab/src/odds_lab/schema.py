@@ -228,6 +228,13 @@ TRADE_DTYPES: dict[str, str] = {
     "short_strike": "float64",
     "long_strike": "float64",
     "width": "float64",
+    # Per-side strikes. A two-sided structure (iron condor, strangle) has no single
+    # short/long pair, and the lifecycle chart must draw both bands or it silently
+    # hides half the risk. NaN on the side a structure does not use.
+    "short_put_strike": "float64",
+    "long_put_strike": "float64",
+    "short_call_strike": "float64",
+    "long_call_strike": "float64",
     "entry_credit": "float64",
     "exit_debit": "float64",
     "max_loss": "float64",

@@ -82,23 +82,29 @@ class Portfolio:
         `max(20%*S - OTM_amount, 10%*S) * 100 + premium`, floor $250/contract.
         Defined-risk structures use `max_loss * qty * 100` directly (computed by the
         caller from `structure_economics`); this function is not meaningful for those.
-        Sums independently across naked legs (put + call of a strangle) -- an approximation,
-        real brokers usually take the greater single-side requirement plus the other side's
-        premium; documented as a judgement call for the reviewer.
+
+        For a two-sided naked structure (short strangle) the requirement is the GREATER
+        single-side requirement plus the premium received on both sides -- not the sum of
+        both sides. That is the standard Reg-T treatment, and it is the economically right
+        one: the underlying cannot finish below the put strike and above the call strike,
+        so only one side can ever be assigned. Summing the sides overstates the requirement
+        by roughly 2x, which would understate position size and flatter the naked
+        comparison this system exists to make honestly.
         """
-        naked_shorts = [l for l in legs if l.ratio < 0]
-        by_right = {"P": [l for l in legs if l.right == "P"], "C": [l for l in legs if l.right == "C"]}
-        total_per_contract = 0.0
-        for leg in naked_shorts:
-            same_right = by_right[leg.right]
-            has_long_cover = any(x.ratio > 0 for x in same_right)
-            if has_long_cover:
-                continue  # defined risk on this side; not part of the naked formula
-            otm_amount = max(S - leg.strike, 0.0) if leg.right == "P" else max(leg.strike - S, 0.0)
-            total_per_contract += max(0.20 * S - otm_amount, 0.10 * S) * 100.0
-        if total_per_contract <= 0.0:
+        by_right = {r: [x for x in legs if x.right == r] for r in ("P", "C")}
+        side_req: dict[str, float] = {}
+        for right, side_legs in by_right.items():
+            shorts = [x for x in side_legs if x.ratio < 0]
+            if not shorts or any(x.ratio > 0 for x in side_legs):
+                continue  # no naked short on this side (or it is covered => defined risk)
+            worst = 0.0
+            for leg in shorts:
+                otm = max(S - leg.strike, 0.0) if right == "P" else max(leg.strike - S, 0.0)
+                worst = max(worst, max(0.20 * S - otm, 0.10 * S) * 100.0)
+            side_req[right] = worst
+        if not side_req:
             return 0.0
-        per_contract = max(total_per_contract + credit * 100.0, 250.0)
+        per_contract = max(max(side_req.values()) + credit * 100.0, 250.0)
         return per_contract * qty
 
     # -- opening ---------------------------------------------------------------------------

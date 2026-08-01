@@ -2,6 +2,14 @@
 assumptions against a live Theta Terminal. ARCHITECTURE.md §0 "Schema is
 probed, not assumed."
 
+This probes the REST/JSON Terminal API only. The separate CSV-bulk-export path
+(`providers/csv_export.py::CsvExportProvider`) is already ground truth -- confirmed
+by parsing the real fixtures at `data/samples/thetadata_spy_eod_20250819.csv.gz`
+and `data/samples/thetadata_spy_ohlc_1m_20250819_exp20251219.csv.gz` -- and needs no
+live probe. Do not assume this report's findings (or lack of a report at all, if the
+terminal isn't running) say anything about the CSV export format; see
+`csv_export.py`'s module docstring and docs/ARCHITECTURE.md for that.
+
 Hits every endpoint `ThetaDataProvider` uses for one (root, quote_date), dumps
 the raw `header.format` array from each, diffs it against the field names
 `thetadata.py` looks for, and writes a markdown report to

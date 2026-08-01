@@ -1,23 +1,49 @@
 """Theta Terminal local REST adapter. ARCHITECTURE.md §0 "Schema is probed, not assumed."
 
 Everything below the endpoint URLs is coded against the *documented* ThetaData
-wire format, which we could not verify against a live terminal (no outbound
-network in this environment). Treat every constant in `_V3_PATHS`/`_V2_PATHS`,
-every entry in `_FIELD_ALIASES`, and both scaling traps as **UNVERIFIED**
-assumptions -- `odds_lab.data.probe.probe()` is the tool that confirms or
-corrects them against a real subscription, and its report should be read
-before trusting a real ingest run.
+REST/JSON wire format, which we still could not verify against a live terminal (no
+outbound network in this environment). Treat every constant in
+`_V3_PATHS`/`_V2_PATHS`, every entry in `_FIELD_ALIASES`, and the strike/vega/rho
+scaling traps below as **UNVERIFIED** assumptions for *this* (REST) path --
+`odds_lab.data.probe.probe()` is the tool that confirms or corrects them against a
+real subscription, and its report should be read before trusting a real ingest run
+through this module.
+
+That said, real ThetaData *CSV bulk exports* (a different artifact from this REST
+API -- what a Terminal user downloads directly, not what this module's JSON client
+calls) are now ground truth, confirmed against the fixtures at
+`data/samples/thetadata_spy_eod_20250819.csv.gz` and
+`data/samples/thetadata_spy_ohlc_1m_20250819_exp20251219.csv.gz`. That CSV path is
+implemented in `providers/csv_export.py::CsvExportProvider`, not here, and several
+guesses this module's docstring used to make were wrong for that format:
+  - `right` in a real export is the full word "CALL"/"PUT", not a single letter.
+    This module's `.str.upper().str[0]` mapping happens to already handle both
+    spellings correctly -- confirmed against the fixture, not "fixed".
+  - `strike` in the CSV export is DOLLARS, never tenths-of-a-cent. The REST JSON
+    scaling trap below remains genuinely unverified (different endpoint, still no
+    live terminal to check against) and is left in place for that path only.
+  - The CSV export's EOD chain rows carry NO open_interest, NO underlying_price,
+    NO iv, and NO greeks columns at all -- those are separate fetches/joins in
+    `csv_export.py`, exactly as this module already treats greeks/underlying as
+    separate calls from the EOD chain. Unlike before, `open_interest` absent from a
+    payload here now defaults to `OPEN_INTEREST_UNKNOWN` (imported from
+    `csv_export.py`), not 0 -- see that constant's docstring: defaulting missing OI
+    to 0 makes `CostModel.min_open_interest` reject every row and silently produces
+    a zero-trade backtest.
 
 Parsing is driven entirely by the response's `header.format` array (the vendor's
 own column-order manifest), never by hardcoded positions -- if a field we need
 is missing from that array we raise `ThetaError` naming exactly what's missing
 and the format array we actually got, rather than silently mis-column a row.
 
-Two documented scaling traps, asserted rather than trusted:
+Two documented scaling traps, asserted rather than trusted -- REST/JSON path only,
+still UNVERIFIED:
   - `strike` may be in **tenths of a cent** (140000 == $140.00). Auto-detected by
     comparing the median strike to the day's underlying price (`strike_scale="auto"`,
     the default): if `median(strike) > 20 * underlying_price`, we divide by 1000.
-    Overridable via `ThetaDataProvider(strike_scale=1000 | 1 | "auto")`.
+    Overridable via `ThetaDataProvider(strike_scale=1000 | 1 | "auto")`. (The real
+    CSV export confirms this heuristic is at least *harmless* on dollars-denominated
+    strikes -- see `tests/test_data.py::test_thetadata_strike_autodetect_leaves_real_dollars_alone`.)
   - `vega` and `rho`, when present in a greeks payload, are divided by 100 to match
     `quant.bs`'s "per 1 vol point" / "per 1% rate move" convention.
 """
@@ -35,6 +61,7 @@ import requests
 
 from odds_lab import schema
 from odds_lab.data.providers.base import ChainProvider
+from odds_lab.data.providers.csv_export import OPEN_INTEREST_UNKNOWN
 
 __all__ = [
     "ThetaDataProvider",
@@ -377,7 +404,10 @@ class ThetaDataProvider(ChainProvider):
                 "ask_size": _opt("ask_size", eod_fmt, eod_df, "int32", 0),
                 "last": _opt("last", eod_fmt, eod_df, float, np.nan),
                 "volume": _opt("volume", eod_fmt, eod_df, "int64", 0),
-                "open_interest": _opt("open_interest", eod_fmt, eod_df, "int64", 0),
+                # OPEN_INTEREST_UNKNOWN, never 0 -- module docstring: OI is a
+                # separate fetch on ThetaData and a real "no OI reported" must not
+                # look like a real OI of zero to CostModel.min_open_interest.
+                "open_interest": _opt("open_interest", eod_fmt, eod_df, "int64", OPEN_INTEREST_UNKNOWN),
                 "underlying_price": float(underlying_price),
                 "source": "thetadata",
                 "is_synthetic": False,

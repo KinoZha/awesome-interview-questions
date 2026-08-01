@@ -15,6 +15,7 @@ Resumable + idempotent:
 from __future__ import annotations
 
 import json
+import time
 from datetime import date
 from typing import Sequence
 
@@ -119,13 +120,19 @@ def ingest(
             chunks = month_buffer.pop(key, None)
             if not chunks:
                 return
+            t0 = time.perf_counter()
             month_chain = pd.concat(chunks, ignore_index=True)
             month_chain = _enrich(month_chain, r=risk_free_rate, q=q_root)
             store.write_chain(month_chain)
             rows_written += len(month_chain)
             if progress:
                 y, m = key
-                print(f"[ingest] {root} {y}-{m:02d}: +{len(month_chain)} rows")
+                elapsed = time.perf_counter() - t0
+                rate = len(month_chain) / elapsed if elapsed > 0 else float("inf")
+                print(
+                    f"[ingest] {root} {y}-{m:02d}: +{len(month_chain)} rows "
+                    f"({elapsed:.2f}s, {rate:,.0f} rows/s enrich+write)"
+                )
 
         current_key: tuple[int, int] | None = None
         for d in trading_dates:

@@ -3,8 +3,11 @@ CLAUDE.md testing rules apply -- no live network, everything deterministic."""
 
 from __future__ import annotations
 
+import gzip
 import math
+import shutil
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -14,10 +17,22 @@ from odds_lab import schema
 from odds_lab.data import probe as probe_mod
 from odds_lab.data.ingest import ingest
 from odds_lab.data.providers import thetadata as td
+from odds_lab.data.providers.csv_export import (
+    EOD_HEADER,
+    OHLC_1M_HEADER,
+    OPEN_INTEREST_UNKNOWN,
+    CsvExportError,
+    CsvExportProvider,
+    read_ohlc_1m_csv,
+)
 from odds_lab.data.providers.synthetic import SyntheticProvider, _third_friday, make_sample_store
 from odds_lab.data.store import ChainStore
 
 pytestmark = pytest.mark.filterwarnings("ignore")
+
+_SAMPLES_DIR = Path(__file__).resolve().parents[1] / "data" / "samples"
+_EOD_FIXTURE = _SAMPLES_DIR / "thetadata_spy_eod_20250819.csv.gz"
+_OHLC_1M_FIXTURE = _SAMPLES_DIR / "thetadata_spy_ohlc_1m_20250819_exp20251219.csv.gz"
 
 
 # ---------------------------------------------------------------------------------
@@ -442,3 +457,304 @@ def test_coverage_multi_root(sample_store):
     assert set(cov["root"]) == {"SPY", "QQQ"}
     assert (cov["n_rows"] > 0).all()
     assert (cov["n_expiries"] > 0).all()
+
+
+# ---------------------------------------------------------------------------------
+# Real ThetaData CSV export fixtures -- ground truth. See csv_export.py's module
+# docstring and docs/ARCHITECTURE.md's data-source section.
+# ---------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def raw_eod_fixture() -> pd.DataFrame:
+    return pd.read_csv(_EOD_FIXTURE)
+
+
+@pytest.fixture(scope="module")
+def raw_ohlc_1m_fixture() -> pd.DataFrame:
+    return pd.read_csv(_OHLC_1M_FIXTURE)
+
+
+def test_eod_fixture_header_is_exactly_ground_truth(raw_eod_fixture):
+    assert list(raw_eod_fixture.columns) == EOD_HEADER
+
+
+def test_eod_fixture_row_count(raw_eod_fixture):
+    assert len(raw_eod_fixture) == 8768
+
+
+def test_eod_fixture_right_is_call_put_words(raw_eod_fixture):
+    assert set(raw_eod_fixture["right"].unique()) == {"CALL", "PUT"}
+
+
+def test_eod_fixture_strike_is_dollars_not_tenths_of_cent(raw_eod_fixture):
+    # A tenths-of-a-cent SPY strike would be ~15000-100000; real dollar strikes for
+    # SPY sit in the low hundreds to ~1000 -- exactly what the fixture shows.
+    assert raw_eod_fixture["strike"].min() >= 100
+    assert raw_eod_fixture["strike"].max() <= 1200
+
+
+def test_eod_fixture_no_crossed_quotes(raw_eod_fixture):
+    assert (raw_eod_fixture["bid"] <= raw_eod_fixture["ask"]).all()
+
+
+def test_eod_fixture_close_is_not_a_mark(raw_eod_fixture):
+    """The regression this whole ground-truth exercise exists to prevent: `close`
+    is zero on a huge fraction of rows that nonetheless carry a live, tradeable
+    bid/ask. Anything that marks off `close`/`last` silently zeroes out those
+    positions; marking must come from the bid/ask mid instead."""
+    close_zero = raw_eod_fixture["close"] == 0
+    assert int(close_zero.sum()) == 4426
+    live_quote_no_trade = close_zero & (raw_eod_fixture["bid"] > 0)
+    assert int(live_quote_no_trade.sum()) == 4107
+
+    mid = (raw_eod_fixture["bid"] + raw_eod_fixture["ask"]) / 2.0
+    marks_from_mid = mid[live_quote_no_trade]
+    assert (marks_from_mid > 0).all(), "mid-based mark must be nonzero wherever bid/ask is live"
+
+
+def test_eod_fixture_worthless_far_otm_bids(raw_eod_fixture):
+    assert int((raw_eod_fixture["bid"] <= 0).sum()) == 500
+
+
+def test_ohlc_1m_fixture_header_is_exactly_ground_truth(raw_ohlc_1m_fixture):
+    assert list(raw_ohlc_1m_fixture.columns) == OHLC_1M_HEADER
+
+
+def test_ohlc_1m_fixture_row_count(raw_ohlc_1m_fixture):
+    assert len(raw_ohlc_1m_fixture) == 58259
+
+
+def test_ohlc_1m_fixture_mostly_all_zero_bars(raw_ohlc_1m_fixture):
+    all_zero = (raw_ohlc_1m_fixture[["open", "high", "low", "close", "volume"]] == 0).all(axis=1)
+    assert int(all_zero.sum()) == 56602
+    assert all_zero.mean() > 0.97
+
+
+def test_ohlc_1m_fixture_vwap_nonzero_on_zero_close_bars(raw_ohlc_1m_fixture):
+    """vwap is not a trustworthy per-bar price: it's populated (stale/carried) on
+    thousands of bars where no trade happened this minute."""
+    trap = (raw_ohlc_1m_fixture["vwap"] > 0) & (raw_ohlc_1m_fixture["close"] == 0)
+    assert int(trap.sum()) == 43645
+
+
+def test_read_ohlc_1m_csv_refuses_price_on_all_zero_bar():
+    df = read_ohlc_1m_csv(_OHLC_1M_FIXTURE)
+    all_zero = (df[["open", "high", "low", "close", "volume"]] == 0).all(axis=1)
+    assert int(all_zero.sum()) == 56602
+    # every all-zero bar must have NaN price, regardless of a nonzero vwap
+    assert df.loc[all_zero, "price"].isna().all()
+    # a real (non-all-zero) bar must keep a real price
+    assert df.loc[~all_zero, "price"].notna().all()
+    assert (df.loc[~all_zero, "price"] == df.loc[~all_zero, "close"]).all()
+    # the vwap trap: plenty of all-zero bars still carry vwap > 0, and price must
+    # not have leaked it in
+    trap = all_zero & (df["vwap"] > 0)
+    assert int(trap.sum()) == 43645
+    assert df.loc[trap, "price"].isna().all()
+
+
+def test_read_ohlc_1m_csv_missing_column_raises(tmp_path):
+    bad = tmp_path / "bad.csv"
+    bad.write_text("symbol,expiration,strike,right,timestamp,open,high,low,close,volume,count\n"
+                    "SPY,2025-12-19,690.0,CALL,2025-08-19T09:30:00,0,0,0,0,0,0\n")
+    with pytest.raises(CsvExportError):
+        read_ohlc_1m_csv(bad)
+
+
+# ---------------------------------------------------------------------------------
+# CsvExportProvider
+# ---------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def csv_export_dir(tmp_path) -> Path:
+    """A directory shaped like a real user's ThetaData export folder: the real EOD
+    fixture plus a small synthetic underlying-EOD companion file (no real fixture
+    exists for the underlying export -- see csv_export.py's UNVERIFIED note)."""
+    d = tmp_path / "theta_exports"
+    d.mkdir()
+    shutil.copy(_EOD_FIXTURE, d / _EOD_FIXTURE.name)
+    underlying = pd.DataFrame(
+        {
+            "date": ["2025-08-19"],
+            "open": [640.0],
+            "high": [644.0],
+            "low": [638.0],
+            "close": [642.35],
+            "volume": [50_000_000],
+        }
+    )
+    underlying.to_csv(d / "SPY_underlying.csv", index=False)
+    return d
+
+
+@pytest.fixture
+def csv_provider(csv_export_dir) -> CsvExportProvider:
+    return CsvExportProvider(directory=csv_export_dir, progress=False)
+
+
+def test_csv_export_provider_trading_dates(csv_provider):
+    dates = csv_provider.trading_dates(date(2025, 1, 1), date(2025, 12, 31))
+    assert dates == [date(2025, 8, 19)]
+
+
+def test_csv_export_provider_expirations(csv_provider):
+    exps = csv_provider.expirations("SPY", date(2025, 8, 19))
+    assert exps
+    assert all(e > date(2025, 8, 19) for e in exps)
+    assert exps == sorted(exps)
+
+
+def test_csv_export_provider_chain_eod_row_count_and_schema(csv_provider):
+    df = csv_provider.chain_eod("SPY", date(2025, 8, 19))
+    assert len(df) == 8768
+    schema.validate_chain(df, strict=False)  # raises on any contract violation
+
+
+def test_csv_export_provider_maps_right_to_letters(csv_provider):
+    df = csv_provider.chain_eod("SPY", date(2025, 8, 19))
+    assert set(df["right"].unique()) == {"C", "P"}
+
+
+def test_csv_export_provider_strike_left_as_dollars(csv_provider):
+    df = csv_provider.chain_eod("SPY", date(2025, 8, 19))
+    row = df[(np.isclose(df["strike"], 613.0)) & (df["right"] == "P")]
+    assert not row.empty
+    assert df["strike"].max() < 2000  # would be >100,000 if wrongly treated as tenths-of-cent
+
+
+def test_csv_export_provider_no_crossed_quotes(csv_provider):
+    df = csv_provider.chain_eod("SPY", date(2025, 8, 19))
+    assert (df["bid"] <= df["ask"]).all()
+
+
+def test_csv_export_provider_open_interest_is_unknown_sentinel_not_zero(csv_provider):
+    df = csv_provider.chain_eod("SPY", date(2025, 8, 19))
+    assert (df["open_interest"] == OPEN_INTEREST_UNKNOWN).all()
+    assert OPEN_INTEREST_UNKNOWN < 0, "sentinel must be distinguishable from a real OI of 0"
+
+
+def test_csv_export_provider_underlying_join(csv_provider):
+    df = csv_provider.chain_eod("SPY", date(2025, 8, 19))
+    assert (df["underlying_price"] == 642.35).all()
+    assert (df["source"] == "csv_export").all()
+
+
+def test_csv_export_provider_mark_comes_from_mid_not_close(csv_provider):
+    """The same regression as the raw-fixture test, exercised through the provider:
+    a row with close==0 (mapped to `last`==0) but a live bid/ask must yield a
+    nonzero mid -- the value marking actually uses."""
+    df = csv_provider.chain_eod("SPY", date(2025, 8, 19))
+    dead_last_live_quote = (df["last"] == 0) & (df["bid"] > 0)
+    assert dead_last_live_quote.sum() == 4107
+    mid = (df.loc[dead_last_live_quote, "bid"] + df.loc[dead_last_live_quote, "ask"]) / 2.0
+    assert (mid > 0).all()
+
+
+def test_csv_export_provider_underlying_price_required_raises_clear_error(tmp_path):
+    d = tmp_path / "no_underlying"
+    d.mkdir()
+    shutil.copy(_EOD_FIXTURE, d / _EOD_FIXTURE.name)
+    provider = CsvExportProvider(directory=d, progress=False)
+    with pytest.raises(CsvExportError, match="underlying"):
+        provider.chain_eod("SPY", date(2025, 8, 19))
+
+
+def test_csv_export_provider_underlying_price_never_silently_nan(csv_provider):
+    df = csv_provider.chain_eod("SPY", date(2025, 8, 19))
+    assert df["underlying_price"].notna().all()
+    assert (df["underlying_price"] > 0).all()
+
+
+def test_csv_export_provider_parity_fallback_is_opt_in_and_flagged(tmp_path):
+    d = tmp_path / "parity_only"
+    d.mkdir()
+    shutil.copy(_EOD_FIXTURE, d / _EOD_FIXTURE.name)
+    off = CsvExportProvider(directory=d, progress=False)
+    with pytest.raises(CsvExportError):
+        off.chain_eod("SPY", date(2025, 8, 19))
+
+    on = CsvExportProvider(directory=d, progress=False, infer_underlying_from_parity=True)
+    df = on.chain_eod("SPY", date(2025, 8, 19))
+    assert (df["source"] == "csv_export+parity").all()
+    assert (df["underlying_price"] > 0).all()
+
+
+def test_csv_export_provider_wrong_glob_raises_clear_error(tmp_path):
+    d = tmp_path / "empty_dir"
+    d.mkdir()
+    provider = CsvExportProvider(directory=d, progress=False)
+    with pytest.raises(CsvExportError, match="no EOD export"):
+        provider.chain_eod("SPY", date(2025, 8, 19))
+
+
+def test_csv_export_provider_underlying_eod_range(csv_provider):
+    df = csv_provider.underlying_eod("SPY", date(2025, 8, 1), date(2025, 8, 31))
+    assert len(df) == 1
+    schema.validate_frame(df, schema.UNDERLYING_DTYPES, "underlying")
+
+
+# ---------------------------------------------------------------------------------
+# CsvExportProvider -> ingest -> ChainStore end-to-end
+# ---------------------------------------------------------------------------------
+
+
+def test_csv_export_provider_end_to_end_through_store(csv_provider, tmp_path):
+    store = ChainStore(tmp_path / "store")
+    manifest = ingest(
+        csv_provider, store, ["SPY"], date(2025, 8, 19), date(2025, 8, 19), progress=False
+    )
+    assert manifest["roots"]["SPY"]["rows_written_this_run"] > 0
+
+    df = store.chain("SPY", date(2025, 8, 19))
+    assert not df.empty
+    validated = schema.validate_chain(df, strict=True)
+    assert (validated["open_interest"] == OPEN_INTEREST_UNKNOWN).all()
+    # greeks were computed by quant.bs.enrich_chain, not left NaN across the board --
+    # near-the-money contracts in particular must have a real IV/delta.
+    near_atm = validated[np.isclose(validated["strike"], 642.0, atol=5.0)]
+    assert not near_atm.empty
+    assert near_atm["iv"].notna().any()
+    assert near_atm["delta"].notna().any()
+
+
+# ---------------------------------------------------------------------------------
+# thetadata.py -- OI-unknown sentinel + strike auto-detect vs real dollars
+# ---------------------------------------------------------------------------------
+
+
+def test_thetadata_open_interest_absent_defaults_to_unknown_not_zero():
+    eod_fmt = ["root", "expiration", "strike", "right", "date", "bid", "ask"]
+    eod_df = pd.DataFrame(
+        {
+            "root": ["SPY"],
+            "expiration": ["20251219"],
+            "strike": [640.0],
+            "right": ["C"],
+            "date": ["20250819"],
+            "bid": [1.0],
+            "ask": [1.1],
+        }
+    )
+    provider = td.ThetaDataProvider()
+    out = provider._parse_chain(
+        "SPY", date(2025, 8, 19), date(2025, 12, 19), eod_df, eod_fmt, pd.DataFrame(), [], 642.35
+    )
+    assert (out["open_interest"] == OPEN_INTEREST_UNKNOWN).all()
+    assert not (out["open_interest"] == 0).any()
+
+
+def test_thetadata_strike_autodetect_leaves_real_dollars_alone(raw_eod_fixture):
+    """The regression named in the module docstring: `strike_scale='auto'`'s
+    median>20x heuristic must not rescale real, already-dollars strikes."""
+    eod_fmt = ["symbol", "expiration", "strike", "right", "bid", "ask"]
+    eod_df = raw_eod_fixture.rename(columns={"symbol": "symbol"})[
+        ["symbol", "expiration", "strike", "right", "bid", "ask"]
+    ]
+    underlying_price = 642.35
+    provider = td.ThetaDataProvider(strike_scale="auto")
+    out = provider._parse_chain(
+        "SPY", date(2025, 8, 19), date(2025, 12, 19), eod_df, eod_fmt, pd.DataFrame(), [], underlying_price
+    )
+    assert np.allclose(sorted(out["strike"].unique()), sorted(raw_eod_fixture["strike"].unique()))

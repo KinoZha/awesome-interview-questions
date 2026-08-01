@@ -28,11 +28,14 @@ interface with adapters for ThetaData, Polygon flat files, ORATS, and plain CSV/
 Swapping providers must never touch strategy or engine code.
 
 **Schema is probed, not assumed.**
-ThetaData responses carry a `header.format` array naming the columns. The parser is driven
-by that array at runtime rather than by hardcoded positions, and `odds-lab probe` dumps the
-live format arrays and diffs them against our expectations. Two documented scaling traps are
-asserted, not trusted: `strike` is in **tenths of a cent** (140000 == $140.00) while
-OHLC/bid/ask are in dollars, and `vega`/`rho` need dividing by 100.
+There are two distinct ThetaData surfaces and they do not agree. The **CSV export** is now
+ground truth — real files are committed as fixtures and the parser is pinned to them (§0.5).
+The **REST/JSON** path remains unverified: responses carry a `header.format` array naming the
+columns, so the parser is driven by that array at runtime rather than by hardcoded positions,
+and `odds-lab probe` dumps the live format arrays and diffs them against our expectations.
+Two documented REST scaling traps are asserted, not trusted: `strike` may be in tenths of a
+cent (140000 == $140.00) while OHLC/bid/ask are in dollars — note the CSV export uses plain
+dollars, so this is detected rather than assumed — and `vega`/`rho` need dividing by 100.
 
 **Synthetic data so the pipeline is testable now.**
 `providers/synthetic.py` generates a full arbitrage-consistent chain (underlying by a
@@ -40,6 +43,93 @@ regime-switching jump-diffusion, chain by BS with a fitted smile + a realistic b
 spread and OI profile). It exists so every module has tests and the report renders today,
 without a ThetaData subscription. It is clearly labelled and never silently substituted
 for real data — a run on synthetic data stamps `SYNTHETIC` on every report page.
+
+## 0.5 Real ThetaData CSV export ground truth
+
+The ThetaData adapter was originally written against guessed/documented behavior
+(no outbound network in this sandbox). Real ThetaData CSV bulk exports are now
+committed as fixtures and are authoritative over any earlier guess:
+
+```
+data/samples/thetadata_spy_eod_20250819.csv.gz
+data/samples/thetadata_spy_ohlc_1m_20250819_exp20251219.csv.gz
+```
+
+These are a different artifact from `providers/thetadata.py`'s REST/JSON client --
+a Terminal user's direct CSV download, not the JSON API this sandbox could never
+reach. `providers/csv_export.py::CsvExportProvider` reads directories of files
+shaped like these; it is the path that matters operationally, since a real user's
+chain history is hundreds of MB to GB of exactly this on their own machine and
+never touches this sandbox. The REST/JSON path in `thetadata.py` remains
+unverified and is confirmed/corrected only by `odds-lab probe` against a live
+terminal.
+
+**EOD chain export header** (exact, in order):
+```
+symbol,expiration,strike,right,created,last_trade,open,high,low,close,volume,count,
+bid_size,bid_exchange,bid,bid_condition,ask_size,ask_exchange,ask,ask_condition
+```
+
+**1-minute OHLC export header** (exact, in order):
+```
+symbol,expiration,strike,right,timestamp,open,high,low,close,volume,count,vwap
+```
+
+Facts confirmed by measuring the fixtures, and what they mean for every consumer:
+
+- **`strike` is DOLLARS**, not tenths-of-a-cent, in this export mode (690.000, not
+  690000). `thetadata.py`'s REST client has a median>20x auto-detect heuristic for
+  the tenths-of-cent case; it correctly leaves real dollar strikes alone (asserted
+  by `tests/test_data.py::test_thetadata_strike_autodetect_leaves_real_dollars_alone`
+  against the real fixture), but do not "fix" it into always assuming dollars --
+  the REST/JSON scaling behavior is still unverified independently of this.
+- **`right` is the string `"CALL"`/`"PUT"`**, mapped explicitly to `'C'`/`'P'`
+  (`csv_export._map_right`).
+- **`expiration` is an ISO date string; `created`/`last_trade` are ISO
+  timestamps.** No `ms_of_day` int, no `YYYYMMDD` int, in this export mode -- it is
+  a whole-day-at-once export, not an intraday snapshot. `CsvExportProvider` writes
+  `ms_of_day=0` for every row purely to satisfy `schema.validate_chain(strict=True)`;
+  it is not a real timestamp and must not be read as one.
+- **`close`/`last` is NOT a mark.** 4107 of 8768 EOD fixture rows have `close == 0`
+  while carrying a live bid/ask -- no trade happened that day, but the contract is
+  still quoted and tradeable. Any code that marks a position off `close`/`last`
+  silently zeroes out roughly half of a real backtest's positions on any given day.
+  Marking MUST use the bid/ask mid (`quant.bs.enrich_chain` already does this
+  correctly -- `mid = (bid + ask) / 2`, never `close`). Asserted directly in
+  `tests/test_data.py::test_eod_fixture_close_is_not_a_mark` and
+  `::test_csv_export_provider_mark_comes_from_mid_not_close`.
+- **500 rows have `bid <= 0`** (worthless, far-OTM contracts nobody is bidding on).
+- **The 1-minute export's `vwap` is not a trustworthy per-bar price.** 97.2% of
+  bars are all-zero (open=high=low=close=volume=0, i.e. no trade printed that
+  minute), and 43645 of those all-zero bars still carry `vwap > 0` -- a stale or
+  carried value, not a real trade. `csv_export.read_ohlc_1m_csv` computes a `price`
+  column that is `close` on a real bar and `NaN` on an all-zero bar, deliberately
+  ignoring `vwap` as a fallback; anyone computing intraday returns off this export
+  must use that `price` column, never `close` or `vwap` directly.
+- There is **no `underlying_price`, no `open_interest`, no `iv`, and no greeks
+  column** in the EOD chain export -- they come from other endpoints/exports.
+  `CsvExportProvider.underlying_price` is resolved by joining a separate
+  underlying-EOD source (`underlying_path`, or discovered via `underlying_glob` in
+  the same directory); if it cannot resolve one it raises `CsvExportError` naming
+  exactly what it looked for -- it never fills NaN and never silently substitutes 0.
+  An approximate put-call-parity fallback exists (`infer_underlying_from_parity=True`)
+  but is off by default and stamps `source="csv_export+parity"` when used so it can
+  never be mistaken for a real quote.
+
+**Open-interest-unknown policy.** The EOD export has no `open_interest` column at
+all. `CostModel.min_open_interest` (default 100, `strategy/selector.py`) rejects
+the short leg whenever `open_interest < min_open_interest` -- if a provider
+defaulted missing OI to 0, every row would fail that check and the backtest would
+silently place zero trades with no error anywhere. Both `CsvExportProvider` and
+`thetadata.py` (whose REST EOD payload also may not include OI -- it's a separate
+endpoint there too) now emit `providers.csv_export.OPEN_INTEREST_UNKNOWN` (`-1`,
+never a valid real OI) instead of 0 when OI is absent. **This sentinel alone does
+not yet make `strategy/selector.py`'s filter unknown-aware** -- that module is out
+of this change's scope (owned by a concurrent change) and still compares
+`open_interest < min_open_interest` as before, which currently treats "unknown"
+(-1) the same as "known and too illiquid." Flagged here as a required follow-up:
+`selector.py`'s liquidity check should special-case `open_interest < 0` as "unknown,
+do not use for liquidity filtering" rather than folding it into that comparison.
 
 ## 1. Layout
 

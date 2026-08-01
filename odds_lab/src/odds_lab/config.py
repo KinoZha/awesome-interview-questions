@@ -72,8 +72,17 @@ class EntryConfig:
     pct_otm: float = 0.05
     # strike_rule='empirical_prob'
     target_prob_itm: float = 0.20
-    width_strikes: int = 1
-    """Spread width in strike increments; the sweep varies this over {1,2,3,5}."""
+    width_strikes: int = 2
+    """Spread width in strike increments; the sweep varies this over {1,2,3,5}.
+
+    Default changed from 1 -> 2 (STRATEGY.md §4, "Defaults on $1-spaced ETF strikes")
+    after the selection funnel showed width=1 combined with the OPI $0.30 min_credit
+    produces ZERO trades on SPY/QQQ/IWM: at width=1 the expected-return band
+    (credit <= width/3 for ER<=0.50) already caps an achievable credit near $0.33, and
+    real bid/ask spreads push most candidates out on liquidity before min_credit even
+    applies. width=2 leaves enough room in both the ER band and the credit itself for
+    the OPI $0.30 threshold to mean something on these underlyings, without changing
+    that threshold's dollar value. See STRATEGY.md §4.2 for the measured funnel."""
     dte_min: int = 21
     dte_max: int = 56
     min_credit: float = 0.30

@@ -71,6 +71,28 @@ def _summary_stats(result: "BacktestResult") -> dict:
     )
 
 
+def _funnel_summary(manifest: dict) -> tuple[str, bool]:
+    """Plain-English sentence for the top of the report + whether it's the zero-trade
+    failure mode (STRATEGY.md §8: 'an empty backtest currently renders as if it were a
+    successful one, and that is the worst failure mode here' -- this must be unmissable)."""
+    funnel = (manifest or {}).get("selection_funnel") or {}
+    total = int(funnel.get("opportunities", 0))
+    accepted = int(funnel.get("accepted", 0))
+    rejected: dict = funnel.get("rejected", {})
+
+    if total == 0:
+        return "No entry opportunities were evaluated at all -- check --roots/--start/--end and the data store.", True
+
+    if not rejected or not any(rejected.values()):
+        binding = ""
+    else:
+        top_reason, top_count = max(rejected.items(), key=lambda kv: kv[1])
+        binding = f"; the binding constraint was {top_reason} (rejected {top_count})"
+
+    sentence = f"{total} entry opportunities, {accepted} trade{'s' if accepted != 1 else ''} taken{binding}."
+    return sentence, accepted == 0
+
+
 def _fmt_pct(x: float) -> str:
     return "n/a" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x * 100:.1f}%"
 
@@ -211,6 +233,15 @@ def build_report(result: "BacktestResult", out_path, *, store=None, extra: dict 
             "must not be treated as a real backtest result. ⚠</div>"
         )
 
+    funnel_sentence, funnel_is_empty = _funnel_summary(manifest)
+    if funnel_is_empty:
+        banner += (
+            '<div class="zero-trades-banner">'
+            f"⚠ ZERO TRADES TAKEN — {html.escape(funnel_sentence)} "
+            "This report has no strategy result to show; see section E for the full "
+            "selection funnel. ⚠</div>"
+        )
+
     nav = """
     <nav class="odds-nav">
       <span class="brand">odds_lab</span>
@@ -231,6 +262,7 @@ def build_report(result: "BacktestResult", out_path, *, store=None, extra: dict 
         {result.config.start.isoformat()} &rarr; {result.config.end.isoformat()} &middot;
         run <code>{html.escape(manifest.get("run_id", "n/a"))}</code>
       </p>
+      <p class="funnel-sentence" style="font-size:1.05em">{html.escape(funnel_sentence)}</p>
       {_render_stat_header(stats)}
     </div>
     """
@@ -320,9 +352,23 @@ def build_report(result: "BacktestResult", out_path, *, store=None, extra: dict 
         "<ul>" + "".join(f"<li>{html.escape(str(w))}</li>" for w in warnings[:200]) + "</ul>"
         if warnings else '<p class="odds-empty">No warnings.</p>'
     )
+    funnel_block = _block(js.embed(F.fig_selection_funnel(result)), "Selection funnel")
+    oi_unknown = int((manifest.get("selection_funnel") or {}).get("liquidity_oi_unknown", 0))
+    oi_unknown_html = (
+        f'<p class="odds-empty">Open interest was unavailable (real ThetaData bulk CSV exports have no OI '
+        f"column) for {oi_unknown} candidate{'s' if oi_unknown != 1 else ''} -- the open-interest "
+        "filter was skipped for those, not silently treated as a pass or a fail.</p>"
+        if oi_unknown > 0 else ""
+    )
     section_e = f"""
     <section id="section-e" class="odds-section"><div class="container">
       <h2>E. Run manifest</h2>
+      <p style="color:var(--text-dim)">{html.escape(funnel_sentence)} Every expiry candidate
+      `propose_trade` considered (across every entry opportunity) is attributed to exactly one
+      outcome below -- accepted, or the first filter it failed -- so the bars are mutually
+      exclusive and sum to the total candidates evaluated.</p>
+      {oi_unknown_html}
+      {funnel_block}
       <div class="manifest-grid">
         <div>
           <h3>Config</h3>
@@ -333,7 +379,7 @@ def build_report(result: "BacktestResult", out_path, *, store=None, extra: dict 
           <pre>{manifest_json}</pre>
           <h3>Data-quality warnings</h3>
           {warnings_html}
-          <h3>Rejected trades</h3>
+          <h3>Rejected trades (portfolio-level: margin/style caps)</h3>
           {rejected_html}
         </div>
       </div>

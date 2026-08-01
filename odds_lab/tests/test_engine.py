@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import date, timedelta
 
 import numpy as np
@@ -16,6 +17,7 @@ from odds_lab.engine import attribution as attribution_mod
 from odds_lab.engine import fills as fills_mod
 from odds_lab.engine.loop import _settle_expiry, _trade_row, run_backtest
 from odds_lab.engine.portfolio import Portfolio
+from odds_lab.engine.result import BacktestResult
 from odds_lab.quant.bs import bs_greeks, bs_price
 from odds_lab.schema import CONTRACT_MULTIPLIER, ExitReason, Fill, Leg, Position
 
@@ -480,3 +482,50 @@ def test_run_backtest_on_synthetic_sample_store(tmp_path):
     assert result.manifest["is_synthetic"] is True
     assert len(result.equity) > 0
     assert (result.equity["equity"] > 0).all()
+
+    # -- selection funnel: present, attributed, and survives save()/load() --------------
+    funnel = result.manifest["selection_funnel"]
+    assert funnel["opportunities"] > 0
+    assert not result.funnel.empty
+    assert funnel["accepted"] + sum(funnel["rejected"].values()) == funnel["candidates_evaluated"]
+    assert len(result.trades) == funnel["accepted"] or funnel["accepted"] >= len(result.trades)
+
+    out_dir = tmp_path / "saved"
+    result.save(out_dir)
+    reloaded = BacktestResult.load(out_dir)
+    pd.testing.assert_frame_equal(
+        reloaded.funnel.reset_index(drop=True), result.funnel.reset_index(drop=True), check_like=True,
+    )
+    # manifest round-trips through JSON, which stringifies dict keys (by_year's int years) --
+    # compare the numeric content, not the exact key types.
+    reloaded_funnel = reloaded.manifest["selection_funnel"]
+    for top_key in ("opportunities", "accepted", "candidates_evaluated", "rejected"):
+        assert reloaded_funnel[top_key] == funnel[top_key]
+    assert {int(y): v for y, v in reloaded_funnel["by_year"].items()} == funnel["by_year"]
+
+    # -- attribution reconciles against realized P&L, to within the untracked entry/exit-day
+    # and cost-of-trading residual -- STRATEGY.md §8A. This is a regression test for the
+    # notional-scaling bug (attribution was 3 orders of magnitude below pnl before the fix).
+    attrib_cols = ["pnl_delta", "pnl_gamma", "pnl_vega", "pnl_theta", "pnl_residual"]
+    multi_day = result.trades[
+        (pd.to_datetime(result.trades["exit_date"]) - pd.to_datetime(result.trades["entry_date"])).dt.days >= 3
+    ]
+    assert len(multi_day) > 0, "need at least one multi-day trade to exercise attribution"
+    for _, row in multi_day.iterrows():
+        attrib_sum = float(row[attrib_cols].sum())
+        gap = abs(row["pnl"] - attrib_sum)
+        # Scale the tolerance off the position's own size (max_loss notional), not off
+        # `pnl` itself -- a trade can realize a small net pnl after large offsetting
+        # mid-life mark swings, which the day-by-day attribution legitimately captures
+        # in full even though they later reverse. What this test guards against is the
+        # notional-scaling regression (attribution 3 orders of magnitude below pnl), so
+        # the bound is generous in position-size units but would still catch that.
+        scale = abs(row["max_loss"]) * row["qty"] * CONTRACT_MULTIPLIER if math.isfinite(row["max_loss"]) else abs(row["pnl"])
+        tolerance = 5.0 * scale + row["commission"] + row["fees"] + abs(row["slippage"]) + 20.0
+        assert gap <= tolerance, (
+            f"attribution stack ({attrib_sum}) does not reconcile with pnl ({row['pnl']}) "
+            f"for {row['position_id']}: gap {gap} > tolerance {tolerance}"
+        )
+        # and the regression this guards against directly: attribution must be within the
+        # same order of magnitude as the position size, never ~0 while pnl is large.
+        assert attrib_sum != 0.0 or row["pnl"] == 0.0

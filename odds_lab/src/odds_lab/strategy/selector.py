@@ -23,10 +23,58 @@ from odds_lab.quant.empirical import EmpiricalDist, build_empirical
 from odds_lab.schema import Leg, MarketState
 from odds_lab.strategy import strategies, universe
 
-__all__ = ["select_expiry", "select_strikes", "propose_trade", "TradeProposal"]
+__all__ = [
+    "select_expiry", "select_strikes", "propose_trade", "TradeProposal",
+    "FUNNEL_REASONS", "new_funnel",
+]
 
 _DEBIT_STRATEGIES = {"long_strangle"}
 _DEFINED_RISK_2LEG = {"put_credit_spread", "call_credit_spread"}
+
+
+# --------------------------------------------------------------------------------------
+# Selection funnel -- every `return None` / `continue` below is attributed to exactly one
+# of these named reasons (see docstring on `propose_trade`). No catch-all bucket.
+# --------------------------------------------------------------------------------------
+
+FUNNEL_REASONS: list[str] = [
+    "no_expiry",                   # store.expiries() returned nothing in [dte_min, dte_max]
+    "market_state",                # entry.market_filter blocks this strategy outright today
+    "empty_chain",                 # no chain rows for this expiry (data gap)
+    "no_atm_iv",                   # universe.atm_iv() couldn't compute an ATM IV
+    "no_empirical_dist",           # build_empirical() had insufficient history
+    "no_strike",                   # select_strikes(): no listed strike hit cfg.strike_rule's band/target
+    "no_width_strike",             # select_strikes(): short leg found, but the long leg (width_strikes away) is missing/invalid
+    "structure_economics_error",   # a selected leg has no quote in the chain (schema.SchemaError)
+    "liquidity_no_quote",          # a leg has no quote row on this date's chain
+    "liquidity_spread",            # (ask-bid)/mid exceeds costs.max_spread_pct_of_mid, or mid<=0
+    "liquidity_min_bid",           # short leg bid below costs.min_bid
+    "liquidity_oi",                # short leg open interest below costs.min_open_interest
+    "min_credit",                  # net credit below entry.min_credit
+    "expected_return_band",        # credit/(width-credit) outside (expected_return_min, expected_return_max]
+    "negative_edge",               # entry.require_positive_edge and edge_ev <= 0
+]
+
+
+def new_funnel(root: str, asof: date) -> dict:
+    """A fresh, zero-initialized selection-funnel record for one (root, asof) opportunity."""
+    return {
+        "root": root,
+        "asof": asof,
+        "expiries_considered": 0,
+        "candidates": 0,
+        "rejected": {reason: 0 for reason in FUNNEL_REASONS},
+        "accepted": 0,
+        "best_edge_ev": None,
+        # Informational, NOT part of the `rejected` partition: a real ThetaData bulk CSV
+        # export has no open_interest column at all, so providers emit the
+        # OPEN_INTEREST_UNKNOWN sentinel (-1, never 0 -- see data/providers/csv_export.py).
+        # `liquidity_oi_unknown` counts candidates where the OI filter was SKIPPED because
+        # the data didn't have an answer -- it must not be conflated with `liquidity_oi`
+        # (a real OI reading below the threshold), and it does not by itself reject
+        # anything, so it can co-occur with `accepted`.
+        "liquidity_oi_unknown": 0,
+    }
 
 
 @dataclass
@@ -184,24 +232,61 @@ def select_strikes(
 # --------------------------------------------------------------------------------------
 
 
-def _passes_liquidity(chain: pd.DataFrame, legs: list[Leg], costs: CostModel) -> bool:
+def _liquidity_reason(chain: pd.DataFrame, legs: list[Leg], costs: CostModel) -> tuple[str | None, bool]:
+    """Returns `(reason, oi_was_unknown)`: `reason` is the funnel reason the structure
+    fails OPI §4.2 liquidity, or None if it passes. Checked leg by leg, first failure
+    wins (matches the old short-circuit `_passes_liquidity` behaviour, but now
+    attributed instead of collapsed to a bool).
+
+    `open_interest < 0` is the `OPEN_INTEREST_UNKNOWN` sentinel (real ThetaData bulk CSV
+    exports have no OI column at all -- see data/providers/csv_export.py). Unknown OI
+    must never be treated as "0 contracts of interest": that would silently reject every
+    row once a real (non-synthetic, non-REST) data source is used, exactly the class of
+    zero-trade failure this funnel exists to catch. So the OI check is skipped (not
+    failed) when OI is unknown, and `oi_was_unknown` is set so the caller can still make
+    that visible -- a skipped filter is not the same as a passed one."""
+    oi_was_unknown = False
     for leg in legs:
         row = chain[np.isclose(chain["strike"].astype(float), leg.strike) & (chain["right"] == leg.right)]
         if row.empty:
-            return False
+            return "liquidity_no_quote", oi_was_unknown
         r = row.iloc[0]
         bid, ask = float(r["bid"]), float(r["ask"])
         mid = (bid + ask) / 2.0
         if mid <= 0:
-            return False
+            return "liquidity_spread", oi_was_unknown
         if (ask - bid) / mid > costs.max_spread_pct_of_mid:
-            return False
+            return "liquidity_spread", oi_was_unknown
         if leg.ratio < 0:  # the short (liquidity-sensitive) leg -- OPI §4.2
             if bid < costs.min_bid:
-                return False
-            if float(r["open_interest"]) < costs.min_open_interest:
-                return False
-    return True
+                return "liquidity_min_bid", oi_was_unknown
+            oi = float(r["open_interest"])
+            if oi < 0:
+                oi_was_unknown = True
+            elif oi < costs.min_open_interest:
+                return "liquidity_oi", oi_was_unknown
+    return None, oi_was_unknown
+
+
+def _diagnose_strike_failure(chain: pd.DataFrame, S: float, cfg: EntryConfig, dist: EmpiricalDist | None) -> str:
+    """Called only when `select_strikes` returned None -- re-walks the same branches to
+    say *which* one failed: the short/debit leg pick itself (`no_strike`), or the
+    defined-risk long leg placed `width_strikes` away (`no_width_strike`)."""
+    puts = chain[chain["right"] == "P"]
+    calls = chain[chain["right"] == "C"]
+
+    if cfg.strategy in ("put_credit_spread", "iron_condor", "short_strangle", "short_put"):
+        if _pick(puts, "P", S, cfg, dist) is None:
+            return "no_strike"
+    if cfg.strategy in ("call_credit_spread", "iron_condor", "short_strangle"):
+        if _pick(calls, "C", S, cfg, dist) is None:
+            return "no_strike"
+    if cfg.strategy == "long_strangle":
+        if _pick(puts, "P", S, cfg, dist) is None or _pick(calls, "C", S, cfg, dist) is None:
+            return "no_strike"
+    # Every leg pick succeeded -- select_strikes still returned None, so the failure is in
+    # the width step (no listed strike `width_strikes` away, or it crosses the short leg).
+    return "no_width_strike"
 
 
 def _market_filter_ok(strategy: str, state: MarketState, market_filter: MarketFilter) -> bool:
@@ -353,24 +438,35 @@ def _compute_edge(
 
 def propose_trade(
     store, root: str, asof: date, cfg: BacktestConfig, dist_cache: dict | None = None
-) -> TradeProposal | None:
+) -> tuple[TradeProposal | None, dict]:
     """Select expiry + strikes, price, filter, and rank -- STRATEGY.md §4.1-4.3, §2.
 
     Ranks across all expiries in [dte_min, dte_max] that survive every filter, by highest
-    `edge_ev` (STRATEGY.md §4.2 'Ranking'). Returns None if nothing qualifies.
+    `edge_ev` (STRATEGY.md §4.2 'Ranking').
+
+    Returns `(proposal, funnel)`: `proposal` is None if nothing qualifies; `funnel` is a
+    structured account (see `FUNNEL_REASONS`/`new_funnel`) of what happened to every
+    expiry considered for this (root, asof) opportunity -- every `return` and `continue`
+    below increments exactly one named `funnel['rejected']` counter, so a caller can
+    always answer "why did this opportunity produce zero trades?" without re-deriving it.
     """
     entry = cfg.entry
     if dist_cache is None:
         dist_cache = {}
 
+    funnel = new_funnel(root, asof)
+
     expiries = store.expiries(root, asof, dte_min=entry.dte_min, dte_max=entry.dte_max)
+    funnel["expiries_considered"] = len(expiries)
     if not expiries:
-        return None
+        funnel["rejected"]["no_expiry"] += 1
+        return None, funnel
 
     closes = store.closes(root, end=asof)
     market_state_val = universe.market_state(closes, asof)
     if not _market_filter_ok(entry.strategy, market_state_val, entry.market_filter):
-        return None
+        funnel["rejected"]["market_state"] += len(expiries)
+        return None, funnel
     realized_vol_val = universe.realized_vol(closes, asof) if len(closes[pd.DatetimeIndex(closes.index) < pd.Timestamp(asof)]) > 21 else float("nan")
 
     candidates: list[TradeProposal] = []
@@ -378,6 +474,7 @@ def propose_trade(
     for expiry in expiries:
         chain = store.chain(root, asof, expiry=expiry)
         if chain.empty:
+            funnel["rejected"]["empty_chain"] += 1
             continue
         schema.assert_no_lookahead(chain, asof)
         S = float(chain["underlying_price"].iloc[0])
@@ -385,6 +482,7 @@ def propose_trade(
         try:
             atm_iv_val = universe.atm_iv(chain, expiry)
         except ValueError:
+            funnel["rejected"]["no_atm_iv"] += 1
             continue
 
         iv_key = ("iv_hist", root)
@@ -409,11 +507,13 @@ def propose_trade(
             try:
                 dist = build_empirical(closes, horizon, cfg.empirical, asof)
             except ValueError:
+                funnel["rejected"]["no_empirical_dist"] += 1
                 continue
             dist_cache[dist_key] = dist
 
         strikes = select_strikes(chain, S, entry, dist=dist)
         if strikes is None:
+            funnel["rejected"][_diagnose_strike_failure(chain, S, entry, dist)] += 1
             continue
 
         legs = strategies.build_legs(
@@ -425,19 +525,26 @@ def propose_trade(
         try:
             econ = strategies.structure_economics(legs, chain)
         except schema.SchemaError:
+            funnel["rejected"]["structure_economics_error"] += 1
             continue
         credit, max_loss, width = econ["credit"], econ["max_loss"], econ["width"]
 
-        if not _passes_liquidity(chain, legs, cfg.costs):
+        liq_reason, oi_was_unknown = _liquidity_reason(chain, legs, cfg.costs)
+        if oi_was_unknown:
+            funnel["liquidity_oi_unknown"] += 1
+        if liq_reason is not None:
+            funnel["rejected"][liq_reason] += 1
             continue
 
         is_debit = entry.strategy in _DEBIT_STRATEGIES
         if not is_debit:
             if credit < entry.min_credit:
+                funnel["rejected"]["min_credit"] += 1
                 continue
             if math.isfinite(max_loss) and max_loss > 0:
                 er = credit / (width - credit) if (width - credit) > 0 else math.inf
                 if not (entry.expected_return_min < er <= entry.expected_return_max):
+                    funnel["rejected"]["expected_return_band"] += 1
                     continue
 
         r = cfg.risk_free_rate
@@ -448,6 +555,7 @@ def propose_trade(
 
         if entry.require_positive_edge and not is_debit:
             if not (edge["edge_ev"] > 0):
+                funnel["rejected"]["negative_edge"] += 1
                 continue
 
         dte_entry = (expiry - asof).days
@@ -472,7 +580,13 @@ def propose_trade(
             )
         )
 
+    funnel["candidates"] = len(candidates)
     if not candidates:
-        return None
+        return None, funnel
 
-    return max(candidates, key=lambda c: c.meta["edge_ev"] if math.isfinite(c.meta["edge_ev"]) else -math.inf)
+    finite_evs = [c.meta["edge_ev"] for c in candidates if math.isfinite(c.meta["edge_ev"])]
+    funnel["accepted"] = 1
+    funnel["best_edge_ev"] = max(finite_evs) if finite_evs else None
+
+    best = max(candidates, key=lambda c: c.meta["edge_ev"] if math.isfinite(c.meta["edge_ev"]) else -math.inf)
+    return best, funnel

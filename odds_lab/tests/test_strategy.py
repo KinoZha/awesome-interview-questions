@@ -342,7 +342,7 @@ def _base_cfg(**entry_kwargs) -> BacktestConfig:
     )
 
 
-def _rich_store(oi=500, bid=1.40, spread_ok=True) -> FakeStore:
+def _rich_store(oi=500, bid=1.40, spread_ok=True, ask=None) -> FakeStore:
     """A FakeStore with one valid put-credit-spread candidate at EXPIRY. The strike the
     delta rule selects (200.0 put, short leg) can be perturbed for filter tests."""
     store = FakeStore()
@@ -353,7 +353,10 @@ def _rich_store(oi=500, bid=1.40, spread_ok=True) -> FakeStore:
         if r["strike"] == 200.0 and r["right"] == "P":
             r["bid"] = bid
             r["oi"] = oi
-            r["ask"] = bid * 3 + 1.0 if not spread_ok else r["ask"]
+            if ask is not None:
+                r["ask"] = ask
+            elif not spread_ok:
+                r["ask"] = bid * 3 + 1.0
         rows.append(r)
     chain = _chain_df(ASOF, EXPIRY, S, rows)
     store.add_chain(ASOF, EXPIRY, chain)
@@ -363,7 +366,7 @@ def _rich_store(oi=500, bid=1.40, spread_ok=True) -> FakeStore:
 def test_propose_trade_selects_valid_candidate():
     store = _rich_store()
     cfg = _base_cfg()
-    proposal = selector.propose_trade(store, ROOT, ASOF, cfg)
+    proposal, funnel = selector.propose_trade(store, ROOT, ASOF, cfg)
     assert proposal is not None
     assert proposal.strategy == "put_credit_spread"
     assert proposal.credit > 0
@@ -373,33 +376,59 @@ def test_propose_trade_selects_valid_candidate():
 
 
 def test_propose_trade_rejects_low_bid():
-    store = _rich_store(bid=0.01)  # below CostModel.min_bid default 0.05
+    # bid below CostModel.min_bid default 0.05, ask tight enough that spread% still passes,
+    # isolating the min_bid filter from the spread filter.
+    store = _rich_store(bid=0.04, ask=0.046)
     cfg = _base_cfg()
-    assert selector.propose_trade(store, ROOT, ASOF, cfg) is None
+    proposal, funnel = selector.propose_trade(store, ROOT, ASOF, cfg)
+    assert proposal is None
+    assert funnel["rejected"]["liquidity_min_bid"] >= 1
+
+
+def test_propose_trade_unknown_open_interest_is_not_rejected():
+    # OPEN_INTEREST_UNKNOWN (-1): real ThetaData bulk CSV exports have no OI column at
+    # all (data/providers/csv_export.py). Unknown OI must be treated as "filter
+    # skipped", never as "0 contracts" -- else every candidate from that data source
+    # would fail the liquidity_oi check and the backtest would silently place zero
+    # trades. This must NOT reject the candidate, and the funnel must say so.
+    store = _rich_store(oi=-1)
+    cfg = _base_cfg()
+    proposal, funnel = selector.propose_trade(store, ROOT, ASOF, cfg)
+    assert proposal is not None
+    assert funnel["rejected"]["liquidity_oi"] == 0
+    assert funnel["liquidity_oi_unknown"] >= 1
 
 
 def test_propose_trade_rejects_low_open_interest():
     store = _rich_store(oi=1)  # below CostModel.min_open_interest default 100
     cfg = _base_cfg()
-    assert selector.propose_trade(store, ROOT, ASOF, cfg) is None
+    proposal, funnel = selector.propose_trade(store, ROOT, ASOF, cfg)
+    assert proposal is None
+    assert funnel["rejected"]["liquidity_oi"] >= 1
 
 
 def test_propose_trade_rejects_wide_spread():
     store = _rich_store(spread_ok=False)
     cfg = _base_cfg()
-    assert selector.propose_trade(store, ROOT, ASOF, cfg) is None
+    proposal, funnel = selector.propose_trade(store, ROOT, ASOF, cfg)
+    assert proposal is None
+    assert funnel["rejected"]["liquidity_spread"] >= 1
 
 
 def test_propose_trade_rejects_below_min_credit():
     store = _rich_store()
     cfg = _base_cfg(min_credit=100.0)  # unreachable
-    assert selector.propose_trade(store, ROOT, ASOF, cfg) is None
+    proposal, funnel = selector.propose_trade(store, ROOT, ASOF, cfg)
+    assert proposal is None
+    assert funnel["rejected"]["min_credit"] >= 1
 
 
 def test_propose_trade_rejects_expected_return_out_of_band():
     store = _rich_store()
     cfg = _base_cfg(expected_return_max=0.001)  # far below achievable ER
-    assert selector.propose_trade(store, ROOT, ASOF, cfg) is None
+    proposal, funnel = selector.propose_trade(store, ROOT, ASOF, cfg)
+    assert proposal is None
+    assert funnel["rejected"]["expected_return_band"] >= 1
 
 
 def test_propose_trade_market_filter_skip_bearish():
@@ -413,7 +442,9 @@ def test_propose_trade_market_filter_skip_bearish():
     store.set_closes(pd.Series(vals, index=idx.date))
     cfg = _base_cfg(market_filter="skip_bearish")
     assert universe.market_state(store.closes(ROOT, ASOF), ASOF) == schema.MarketState.BEARISH
-    assert selector.propose_trade(store, ROOT, ASOF, cfg) is None
+    proposal, funnel = selector.propose_trade(store, ROOT, ASOF, cfg)
+    assert proposal is None
+    assert funnel["rejected"]["market_state"] >= 1
 
 
 def test_propose_trade_require_positive_edge_rejects_negative_ev():
@@ -428,8 +459,9 @@ def test_propose_trade_require_positive_edge_rejects_negative_ev():
     vals = S * np.exp(np.cumsum(rets))
     vals *= S / vals[-1]
     store.set_closes(pd.Series(vals, index=idx.date))
-    proposal = selector.propose_trade(store, ROOT, ASOF, cfg)
+    proposal, funnel = selector.propose_trade(store, ROOT, ASOF, cfg)
     assert proposal is None
+    assert funnel["rejected"]["negative_edge"] >= 1
 
 
 def test_propose_trade_ranks_by_max_edge_ev_not_er():
@@ -443,10 +475,12 @@ def test_propose_trade_ranks_by_max_edge_ev_not_er():
             r["iv"] = 0.60  # richly priced -> the theoretical/empirical gap (edge) is worse
     store.add_chain(ASOF, expiry2, _chain_df(ASOF, expiry2, S, rows2))
     cfg = _base_cfg(dte_max=60)
-    proposal = selector.propose_trade(store, ROOT, ASOF, cfg)
+    proposal, funnel = selector.propose_trade(store, ROOT, ASOF, cfg)
     assert proposal is not None
     # the original (EXPIRY, iv=.17) candidate must win over the richly-priced (expiry2) one
     assert proposal.expiry == EXPIRY
+    assert funnel["candidates"] == 2
+    assert funnel["accepted"] == 1
 
 
 def test_propose_trade_lookahead_raises():

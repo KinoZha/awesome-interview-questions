@@ -124,6 +124,66 @@ the industry-momentum stock screen is dropped, the option-level filters are kept
 | Market-state filter | see §4.3 |
 | Liquidity | short-leg bid > 0, spread(bid,ask)/mid ≤ configurable (default 15%), OI ≥ 100 |
 
+`min_open_interest`'s default (100) is unchanged, but its semantics were clarified: a
+real ThetaData bulk CSV chain export has no open-interest column at all, so
+`data/providers/csv_export.py` (and `thetadata.py`) emit `OPEN_INTEREST_UNKNOWN` (-1,
+never 0) when OI is absent. `strategy/selector.py`'s liquidity filter treats
+`open_interest < 0` as "unknown -- skip this check", never as "0 contracts" -- defaulting
+unknown OI to 0 would fail every row from that data source and reproduce the exact
+silent-zero-trade failure mode this funnel exists to catch, just triggered by the data
+source instead of a threshold. The funnel records this separately as
+`liquidity_oi_unknown` (informational; it does not by itself reject a candidate, so it
+is not part of the `rejected` partition) so a report on real CSV-export data visibly
+says "OI was unavailable for N candidates, the filter was skipped" instead of silently
+looking identical to a passing OI check.
+
+#### 4.2.1 Selection funnel + measured defaults on $1-spaced ETF strikes
+
+`propose_trade` records a structured selection funnel (`engine/loop.py`
+`manifest['selection_funnel']`, per-opportunity detail in `BacktestResult.funnel`) so a
+zero-trade or near-zero-trade run is diagnosable instead of silently reporting "success."
+Running it on `data/sample_store` (SPY/QQQ/IWM, 2015-06-01→2016-12-30, weekly entries,
+`put_credit_spread`, `strike_rule=delta`) gave:
+
+| strike_rule | width_strikes | min_credit | trades | binding rejection reason |
+|---|---|---|---|---|
+| delta | 1 | 0.30 (old default) | **0** | `min_credit` / `liquidity_spread` |
+| delta | 2 | 0.30 | 15 | `liquidity_spread` |
+| delta | 3 | 0.30 | 18 | `liquidity_spread` |
+| delta | 5 | 0.30 | 10 | `liquidity_spread` |
+| delta | 1 | 0.20 | **0** | `min_credit` |
+| delta | 1 | 0.10 | 12 | `liquidity_spread` |
+| delta | 1 | 0.05 | 19 | `liquidity_spread` |
+| pct_otm (±5% baseline) | 1 | 0.30 | **0** | `liquidity_spread` |
+
+Root cause: at `width_strikes=1` the expected-return band (`ER = credit/(width-credit)
+≤ 0.50`) already caps the *achievable* credit near `width/3 ≈ $0.33` before `min_credit`
+is even checked, and real bid/ask spreads on a 1-strike-wide $180 ETF put spread push
+most remaining candidates out on `liquidity_spread` (the OPI $0.30 threshold was written
+for $20-40 single stocks with $2.50-5 strike spacing, where a comparable spread is
+several strikes wide in dollar terms). Lowering `min_credit` alone (0.30→0.20) does not
+fix it -- `width_strikes=1` stays at 0 trades even then; only widening the spread does,
+because it gives both the ER band and the liquidity check room to work with.
+
+**Default changed:** `EntryConfig.width_strikes` 1 → **2**. `min_credit` stays at $0.30
+-- the dollar figure itself is not wrong, it is only infeasible when combined with a
+1-strike width on $1-spaced strikes. This keeps the OPI-sourced numbers intact and fixes
+the defect by picking a different point in OPI's own explicitly-stated width sweep
+(`{1, 2, 3, 5}`) rather than inventing a new threshold. If a caller sets
+`width_strikes=1` explicitly, they should also lower `min_credit` (roughly 10-15% of
+`width_strikes * 100 * increment` reproduces the pre-existing $0.30-at-width-3ish
+strictness) -- expressed as a fraction of spread width, not a bare dollar amount, since
+that is the scale-free quantity that actually transfers across strike spacings; `min_credit`
+itself is left as a dollar figure (unchanged semantics/type) so this is a documented
+rule of thumb for callers, not a code behavior change.
+
+`no_empirical_dist` also dominates the *first* year of any run on `data/sample_store`
+regardless of `width_strikes`/`min_credit`: the store only has 2015-01-01→2016-12-30 of
+history, and `EmpiricalConfig.min_samples=250` overlapping horizon-length windows are not
+available until roughly a year in. This is a data-availability artifact of the small
+sample store, not a defaults problem, and is out of scope for this change (`EmpiricalConfig`
+defaults were not touched) -- flagged here so it isn't mistaken for another dead filter.
+
 ### 4.3 Market-state filter
 `OPI` note: *"evaluate whether or not you want to take the trade if the Market State
 is Bearish or Neutral."* Implemented as a 3-state classifier on the underlying,

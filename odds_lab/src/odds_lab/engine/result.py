@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
@@ -20,6 +20,10 @@ class BacktestResult:
     equity: pd.DataFrame
     snapshots: pd.DataFrame
     manifest: dict
+    funnel: pd.DataFrame = field(default_factory=pd.DataFrame)
+    """One row per (root, scheduled entry date) selection-funnel opportunity -- see
+    `engine.loop.FUNNEL_DTYPES`. `manifest['selection_funnel']` is the aggregate over
+    this frame; this is the raw per-opportunity detail behind it."""
 
     def save(self, path: str | Path) -> Path:
         out = Path(path)
@@ -27,6 +31,7 @@ class BacktestResult:
         self.trades.to_parquet(out / "trades.parquet")
         self.equity.to_parquet(out / "equity.parquet")
         self.snapshots.to_parquet(out / "snapshots.parquet")
+        self.funnel.to_parquet(out / "funnel.parquet")
         (out / "config.json").write_text(json.dumps(self.config.to_dict(), indent=2, sort_keys=True))
         (out / "manifest.json").write_text(json.dumps(self.manifest, indent=2, sort_keys=True, default=str))
         return out
@@ -37,6 +42,8 @@ class BacktestResult:
         trades = pd.read_parquet(src / "trades.parquet")
         equity = pd.read_parquet(src / "equity.parquet")
         snapshots = pd.read_parquet(src / "snapshots.parquet")
+        funnel_path = src / "funnel.parquet"
+        funnel = pd.read_parquet(funnel_path) if funnel_path.exists() else pd.DataFrame()
         config = BacktestConfig.from_dict(json.loads((src / "config.json").read_text()))
         manifest = json.loads((src / "manifest.json").read_text())
-        return cls(config=config, trades=trades, equity=equity, snapshots=snapshots, manifest=manifest)
+        return cls(config=config, trades=trades, equity=equity, snapshots=snapshots, funnel=funnel, manifest=manifest)

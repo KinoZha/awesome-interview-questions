@@ -33,6 +33,82 @@ from odds_lab.strategy import selector
 
 __all__ = ["run_backtest"]
 
+FUNNEL_DTYPES: dict[str, str] = {
+    "root": "string",
+    "asof": "datetime64[ns]",
+    "expiries_considered": "int32",
+    "candidates": "int32",
+    "accepted": "int32",
+    "best_edge_ev": "float64",
+    # Informational, NOT part of the rejected/accepted partition -- see
+    # selector.new_funnel's docstring on `liquidity_oi_unknown`.
+    "liquidity_oi_unknown": "int32",
+    **{f"rejected_{reason}": "int32" for reason in selector.FUNNEL_REASONS},
+}
+"""One row per (root, scheduled entry date) opportunity that `propose_trade` evaluated.
+`rejected_<reason>` columns are always present (zero-filled) so downstream aggregation
+never has to special-case a reason that happened not to fire in a given run."""
+
+
+def _flatten_funnel(funnel: dict) -> dict:
+    row = {
+        "root": funnel["root"],
+        "asof": pd.Timestamp(funnel["asof"]),
+        "expiries_considered": funnel["expiries_considered"],
+        "candidates": funnel["candidates"],
+        "accepted": funnel["accepted"],
+        "best_edge_ev": funnel["best_edge_ev"] if funnel["best_edge_ev"] is not None else float("nan"),
+        "liquidity_oi_unknown": funnel.get("liquidity_oi_unknown", 0),
+    }
+    for reason, count in funnel["rejected"].items():
+        row[f"rejected_{reason}"] = count
+    return row
+
+
+def _aggregate_funnel(funnel_df: pd.DataFrame) -> dict:
+    """`manifest['selection_funnel']`: totals, plus a per-root and per-year breakdown, of
+    every opportunity `propose_trade` evaluated over the run.
+
+    Two denominators coexist here, deliberately:
+      - `opportunities` counts (root, scheduled entry date) calls to `propose_trade` --
+        this is "237 entry opportunities" in the report sentence.
+      - `rejected` counts individual expiry candidates rejected for that reason, summed
+        across all opportunities (one opportunity can evaluate several expiries and
+        contribute several rejections, one apiece, to different or the same reason).
+        `accepted + sum(rejected.values()) == candidates_evaluated`, NOT `opportunities`
+        -- an opportunity with zero listed expiries (`no_expiry`) or a market-filter
+        refusal (`market_state`, charged once per would-have-been-considered expiry)
+        contributes without ever reaching the per-expiry loop.
+    """
+
+    def _stats(sub: pd.DataFrame) -> dict:
+        rejected = {
+            reason: int(sub[f"rejected_{reason}"].sum()) if len(sub) else 0
+            for reason in selector.FUNNEL_REASONS
+        }
+        accepted = int(sub["accepted"].sum()) if len(sub) else 0
+        return {
+            "opportunities": int(len(sub)),
+            "accepted": accepted,
+            "rejected": rejected,
+            "candidates_evaluated": accepted + sum(rejected.values()),
+            "liquidity_oi_unknown": int(sub["liquidity_oi_unknown"].sum()) if len(sub) else 0,
+        }
+
+    if funnel_df.empty:
+        return {
+            "opportunities": 0, "accepted": 0, "candidates_evaluated": 0, "liquidity_oi_unknown": 0,
+            "rejected": {r: 0 for r in selector.FUNNEL_REASONS}, "by_root": {}, "by_year": {},
+        }
+
+    totals = _stats(funnel_df)
+    by_root = {root: _stats(sub) for root, sub in funnel_df.groupby("root")}
+    years = pd.DatetimeIndex(funnel_df["asof"]).year
+    by_year = {int(yr): _stats(funnel_df[years == yr]) for yr in sorted(years.unique())}
+    totals["by_root"] = by_root
+    totals["by_year"] = by_year
+    return totals
+
 
 def _mark_position(pos: Position, chain: pd.DataFrame) -> dict | None:
     """Cost-to-close (mid) + position greeks for one open position on one day's chain.
@@ -192,6 +268,7 @@ def run_backtest(cfg: BacktestConfig, store) -> BacktestResult:
     trades_rows: list[dict] = []
     equity_rows: list[dict] = []
     snapshot_rows: list[dict] = []
+    funnel_records: list[dict] = []
     warnings: list[str] = []
     position_counter = 0
 
@@ -352,7 +429,8 @@ def run_backtest(cfg: BacktestConfig, store) -> BacktestResult:
                 open_count = sum(1 for p in portfolio.positions if p.is_open and p.root == root)
                 if open_count >= cfg.entry.max_concurrent_per_root:
                     continue
-                proposal = selector.propose_trade(store, root, asof, cfg, dist_cache)
+                proposal, funnel = selector.propose_trade(store, root, asof, cfg, dist_cache)
+                funnel_records.append(_flatten_funnel(funnel))
                 if proposal is None:
                     continue
 
@@ -432,6 +510,10 @@ def run_backtest(cfg: BacktestConfig, store) -> BacktestResult:
         schema.validate_frame(pd.DataFrame(snapshot_rows), schema.SNAPSHOT_DTYPES, "snapshots")
         if snapshot_rows else schema.empty_frame(schema.SNAPSHOT_DTYPES)
     )
+    funnel_df = (
+        schema.validate_frame(pd.DataFrame(funnel_records), FUNNEL_DTYPES, "funnel")
+        if funnel_records else schema.empty_frame(FUNNEL_DTYPES)
+    )
 
     coverage = {}
     for root in cfg.roots:
@@ -455,9 +537,13 @@ def run_backtest(cfg: BacktestConfig, store) -> BacktestResult:
         ),
         "rejected_trades": portfolio.rejected_trades,
         "warnings": warnings,
+        "selection_funnel": _aggregate_funnel(funnel_df),
     }
 
-    return BacktestResult(config=cfg, trades=trades_df, equity=equity_df, snapshots=snapshots_df, manifest=manifest)
+    return BacktestResult(
+        config=cfg, trades=trades_df, equity=equity_df, snapshots=snapshots_df,
+        funnel=funnel_df, manifest=manifest,
+    )
 
 
 def _git_sha() -> str:

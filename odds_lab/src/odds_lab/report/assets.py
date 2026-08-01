@@ -76,6 +76,17 @@ body {
   letter-spacing: 0.02em;
 }
 
+.zero-trades-banner {
+  background: var(--danger);
+  border: 2px solid var(--danger);
+  color: #fff;
+  font-weight: 700;
+  text-align: center;
+  padding: 10px 16px;
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
+}
+
 .container { max-width: 1180px; margin: 0 auto; padding: 0 20px 60px; }
 
 .stat-grid {

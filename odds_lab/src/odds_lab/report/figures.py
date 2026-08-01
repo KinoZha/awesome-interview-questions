@@ -40,6 +40,7 @@ __all__ = [
     "fig_cohort_bars",
     "fig_year_week_calendar",
     "fig_strategy_comparison",
+    "fig_selection_funnel",
 ]
 
 # --------------------------------------------------------------------------------------
@@ -744,4 +745,55 @@ def fig_strategy_comparison(results: dict[str, "BacktestResult"]) -> go.Figure:
     if plotted == 0:
         return _empty_fig(title, "no runs with equity history to compare")
     fig.update_layout(xaxis_title="Date", yaxis_title="Equity (indexed to 100 at start)")
+    return fig
+
+
+# --------------------------------------------------------------------------------------
+# Selection funnel -- "why did propose_trade discard almost everything" (STRATEGY.md §8)
+# --------------------------------------------------------------------------------------
+
+
+def fig_selection_funnel(result: "BacktestResult") -> go.Figure:
+    """Horizontal bar chart of the selection funnel from `manifest['selection_funnel']`:
+    every expiry candidate evaluated across all entry opportunities is either accepted
+    (a trade taken) or rejected for exactly one named reason -- so the bars below are a
+    partition of `candidates_evaluated` (accepted + every rejection reason, mutually
+    exclusive by construction), sorted by how many candidates each reason discarded.
+    `candidates_evaluated` is a finer count than `opportunities` (one (root, date) entry
+    decision can evaluate several expiries, e.g. contributing one rejection per expiry)."""
+    title = "Selection funnel: why candidates were discarded"
+    funnel = (result.manifest or {}).get("selection_funnel") or {}
+    opportunities = int(funnel.get("opportunities", 0))
+    if opportunities == 0:
+        return _empty_fig(title, "No entry opportunities were evaluated (empty date range or no roots).")
+
+    accepted = int(funnel.get("accepted", 0))
+    rejected: dict = funnel.get("rejected", {})
+    total = int(funnel.get("candidates_evaluated", accepted + sum(rejected.values()))) or 1
+    reasons = sorted(((r, int(n)) for r, n in rejected.items() if n > 0), key=lambda kv: kv[1])
+
+    labels = ["trades taken"] + [r for r, _ in reasons]
+    values = [accepted] + [n for _, n in reasons]
+    colors = [COLORS["positive"]] + [COLORS["negative"]] * len(reasons)
+
+    fig = _new_fig(title)
+    fig.add_trace(
+        go.Bar(
+            x=values,
+            y=labels,
+            orientation="h",
+            marker_color=colors,
+            text=[f"{v} ({v / total * 100:.0f}%)" for v in values],
+            textposition="outside",
+            hovertemplate="%{y}: %{x} of " + str(total) + " candidates evaluated<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=f"{title}<br><sup>{opportunities} entry opportunities -> {total} expiry candidates evaluated -> {accepted} accepted</sup>",
+        xaxis_title=f"candidates (of {total} evaluated)",
+        yaxis=dict(autorange="reversed"),
+        showlegend=False,
+        margin=dict(l=180, r=60, t=80, b=50),
+        height=max(320, 40 * (len(labels) + 2)),
+    )
     return fig

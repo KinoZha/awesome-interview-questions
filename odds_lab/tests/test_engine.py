@@ -225,6 +225,22 @@ def test_cash_earns_risk_free_rate():
     assert pf.cash == pytest.approx(105_000.0, rel=1e-6)
 
 
+BRIDGE_COLS = [
+    "pnl_delta", "pnl_gamma", "pnl_vega", "pnl_theta", "pnl_residual",
+    "pnl_entry_execution", "pnl_exit_execution", "pnl_costs",
+]
+"""The full P&L bridge, STRATEGY.md §8A: `pnl == sum(BRIDGE_COLS)`, exactly."""
+
+
+def _assert_bridge_closes(row, tol=1e-6) -> None:
+    bridge_sum = sum(float(row[c]) for c in BRIDGE_COLS)
+    gap = abs(float(row["pnl"]) - bridge_sum)
+    assert gap < tol, (
+        f"P&L bridge does not close for {row.get('position_id', '<hand-built>')}: "
+        f"pnl={row['pnl']} bridge_sum={bridge_sum} gap={gap}"
+    )
+
+
 # ======================================================================================
 # expiration settlement -- exact hand-computed P&L
 # ======================================================================================
@@ -267,6 +283,13 @@ def test_expiry_settlement_max_loss_exact():
     assert row["pnl"] == pytest.approx(
         (credit - width) * pos.qty * CONTRACT_MULTIPLIER - (0.65 * 2 * pos.qty + 0.05 * pos.qty)
     )
+    # -- expires at max loss: the bridge closes exactly, and the whole thing lands in
+    # pnl_exit_execution (settlement vs. the -- never recorded, since this position was
+    # never marked while open -- last mark) since there is no greek attribution to speak
+    # of here (STRATEGY.md §8A point 4).
+    _assert_bridge_closes(row)
+    assert row["pnl_delta"] == row["pnl_gamma"] == row["pnl_vega"] == row["pnl_theta"] == 0.0
+    assert row["pnl_exit_execution"] == pytest.approx(-width * pos.qty * CONTRACT_MULTIPLIER)
 
 
 def test_expiry_settlement_max_profit_exact():
@@ -282,6 +305,11 @@ def test_expiry_settlement_max_profit_exact():
     expected_pnl = sum(f.cash for f in pos.open_fills)  # nothing paid/received at settlement
     assert row["pnl"] == pytest.approx(expected_pnl)
     assert row["pnl"] == pytest.approx(credit * pos.qty * CONTRACT_MULTIPLIER - (0.65 * 2 * pos.qty + 0.05 * pos.qty))
+    # -- expires worthless: bridge closes exactly, settlement contributes exactly $0 to
+    # pnl_exit_execution (STRATEGY.md §8A point 4).
+    _assert_bridge_closes(row)
+    assert row["pnl_delta"] == row["pnl_gamma"] == row["pnl_vega"] == row["pnl_theta"] == 0.0
+    assert row["pnl_exit_execution"] == pytest.approx(0.0)
 
 
 # ======================================================================================
@@ -503,29 +531,92 @@ def test_run_backtest_on_synthetic_sample_store(tmp_path):
         assert reloaded_funnel[top_key] == funnel[top_key]
     assert {int(y): v for y, v in reloaded_funnel["by_year"].items()} == funnel["by_year"]
 
-    # -- attribution reconciles against realized P&L, to within the untracked entry/exit-day
-    # and cost-of-trading residual -- STRATEGY.md §8A. This is a regression test for the
-    # notional-scaling bug (attribution was 3 orders of magnitude below pnl before the fix).
-    attrib_cols = ["pnl_delta", "pnl_gamma", "pnl_vega", "pnl_theta", "pnl_residual"]
+    # -- the full P&L bridge closes EXACTLY for every trade, not just multi-day ones --
+    # STRATEGY.md §8A. This supersedes an earlier, much looser check here (attribution
+    # alone vs. pnl, within a tolerance wide enough to swallow the missing execution/cost
+    # terms entirely -- that version would have passed even when attribution explained a
+    # sixth of the money, which is exactly the bug this test now exists to catch).
+    assert len(result.trades) > 0, "need at least one trade to exercise the bridge"
+    for _, row in result.trades.iterrows():
+        _assert_bridge_closes(row, tol=1e-6)
+
+    # and the multi-day subset specifically exercises non-trivial greek terms (guards the
+    # earlier notional-scaling regression: attribution silently ~0 while pnl is large).
     multi_day = result.trades[
         (pd.to_datetime(result.trades["exit_date"]) - pd.to_datetime(result.trades["entry_date"])).dt.days >= 3
     ]
     assert len(multi_day) > 0, "need at least one multi-day trade to exercise attribution"
-    for _, row in multi_day.iterrows():
-        attrib_sum = float(row[attrib_cols].sum())
-        gap = abs(row["pnl"] - attrib_sum)
-        # Scale the tolerance off the position's own size (max_loss notional), not off
-        # `pnl` itself -- a trade can realize a small net pnl after large offsetting
-        # mid-life mark swings, which the day-by-day attribution legitimately captures
-        # in full even though they later reverse. What this test guards against is the
-        # notional-scaling regression (attribution 3 orders of magnitude below pnl), so
-        # the bound is generous in position-size units but would still catch that.
-        scale = abs(row["max_loss"]) * row["qty"] * CONTRACT_MULTIPLIER if math.isfinite(row["max_loss"]) else abs(row["pnl"])
-        tolerance = 5.0 * scale + row["commission"] + row["fees"] + abs(row["slippage"]) + 20.0
-        assert gap <= tolerance, (
-            f"attribution stack ({attrib_sum}) does not reconcile with pnl ({row['pnl']}) "
-            f"for {row['position_id']}: gap {gap} > tolerance {tolerance}"
-        )
-        # and the regression this guards against directly: attribution must be within the
-        # same order of magnitude as the position size, never ~0 while pnl is large.
-        assert attrib_sum != 0.0 or row["pnl"] == 0.0
+    attrib_cols = ["pnl_delta", "pnl_gamma", "pnl_vega", "pnl_theta", "pnl_residual"]
+    assert (multi_day[attrib_cols].sum(axis=1) != 0.0).any()
+
+
+def test_pnl_bridge_reconciles_exactly_multi_root_run(tmp_path):
+    """The scenario the bridge was built for (STRATEGY.md §8A/§4.2.1): weekly put credit
+    spreads across SPY/QQQ/IWM, 2015-06-01 -> 2016-12-30, `width_strikes=2`. Some
+    positions have only two recorded snapshots (entered, profit target hit the very next
+    day) -- greeks explain almost nothing there and execution/costs legitimately dominate;
+    the bridge must still close exactly, and the report must not be able to hide that."""
+    from odds_lab.data.providers.synthetic import make_sample_store
+    from odds_lab.config import DataConfig
+
+    store = make_sample_store(
+        tmp_path / "store", roots=("SPY", "QQQ", "IWM"), start=date(2015, 1, 1), end=date(2016, 12, 30), seed=7,
+    )
+    entry = EntryConfig(
+        strategy="put_credit_spread", strike_rule="delta", delta_min=0.15, delta_max=0.30,
+        width_strikes=2, dte_min=21, dte_max=56, min_credit=0.30, expected_return_min=0.0,
+        expected_return_max=0.50, market_filter="all", require_positive_edge=False,
+        entry_schedule="weekly", entry_weekday=0, max_concurrent_per_root=2,
+    )
+    exits = ExitConfig(profit_target_pct=0.50, stop_loss_multiple=2.0, dte_exit=21, delta_breach=0.50, hold_to_expiry=False)
+    risk = RiskConfig(starting_equity=100_000.0, risk_pct_per_trade=0.05, min_contracts=1, max_contracts=50)
+    empirical = EmpiricalConfig(lookback_years=2.0, min_samples=20, seed=1)
+    cfg = BacktestConfig(
+        roots=("SPY", "QQQ", "IWM"), start=date(2015, 6, 1), end=date(2016, 12, 30),
+        entry=entry, exits=exits, risk=risk, costs=CostModel(), empirical=empirical,
+        data=DataConfig(provider="synthetic", allow_synthetic=True),
+    )
+
+    result = run_backtest(cfg, store)
+    trades = result.trades
+    assert len(trades) > 0, "need at least one trade to exercise the bridge"
+    schema.validate_frame(trades, schema.TRADE_DTYPES, "trades")
+
+    for _, row in trades.iterrows():
+        _assert_bridge_closes(row, tol=1e-6)
+
+    bridge_totals = {c: float(trades[c].sum()) for c in BRIDGE_COLS}
+    greek_total = sum(bridge_totals[c] for c in ("pnl_delta", "pnl_gamma", "pnl_vega", "pnl_theta", "pnl_residual"))
+    exec_and_cost_total = sum(
+        bridge_totals[c] for c in ("pnl_entry_execution", "pnl_exit_execution", "pnl_costs")
+    )
+    total_pnl = float(trades["pnl"].sum())
+    assert greek_total + exec_and_cost_total == pytest.approx(total_pnl, abs=1e-6)
+
+    # every position was marked at least once while open (otherwise there'd be nothing
+    # for the greek terms to explain at all) -- confirms this run actually exercises the
+    # short-window case rather than accidentally testing only long-held trades.
+    snap_counts = result.snapshots.groupby("position_id").size()
+    assert (snap_counts <= 2).any(), (
+        "expected at least one short-lived (<=2 snapshot) position in this run -- "
+        "the bridge's execution terms exist specifically for this cohort"
+    )
+    short_lived_ids = set(snap_counts[snap_counts <= 2].index)
+    short_lived = trades[trades["position_id"].isin(short_lived_ids)]
+    for _, row in short_lived.iterrows():
+        _assert_bridge_closes(row, tol=1e-6)
+    # execution + costs is the real story for this short-lived cohort in aggregate (a
+    # single trade's greeks can be noisy on a 1-day-open synthetic quote, but the whole
+    # cohort should not be dominated by an approximation window that barely existed).
+    exec_cost_total = (
+        short_lived["pnl_entry_execution"].abs().sum()
+        + short_lived["pnl_exit_execution"].abs().sum()
+        + short_lived["pnl_costs"].abs().sum()
+    )
+    greeks_total = (
+        short_lived["pnl_delta"].abs().sum()
+        + short_lived["pnl_gamma"].abs().sum()
+        + short_lived["pnl_vega"].abs().sum()
+        + short_lived["pnl_theta"].abs().sum()
+    )
+    assert exec_cost_total >= greeks_total

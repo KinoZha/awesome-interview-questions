@@ -239,29 +239,67 @@ def fig_monthly_heatmap(result: "BacktestResult") -> go.Figure:
     return fig
 
 
+_BRIDGE_COMPONENTS: list[tuple[str, str]] = [
+    ("pnl_delta", "delta"),
+    ("pnl_gamma", "gamma"),
+    ("pnl_vega", "vega"),
+    ("pnl_theta", "theta"),
+    ("pnl_residual", "residual"),
+    ("pnl_entry_execution", "entry execution"),
+    ("pnl_exit_execution", "exit execution"),
+    ("pnl_costs", "commission + fees"),
+]
+"""Every term in the exact P&L bridge (schema.TRADE_DTYPES docstring, STRATEGY.md §8A):
+`pnl == sum of these`, computed per trade from its own inputs -- greeks explain mark
+movement between recorded snapshots only, execution/costs cover everything a greek can
+never see (the entry fill, the exit fill or settlement, commissions and fees)."""
+
+
 def fig_attribution_stack(result: "BacktestResult") -> go.Figure:
-    """Cumulative greek P&L attribution + costs, per trade, over calendar time
-    (ARCHITECTURE.md §4)."""
+    """The full P&L bridge as a waterfall: greeks, then execution, then costs, summing
+    exactly to the realized P&L bar at the end (STRATEGY.md §8A). Aggregated across every
+    trade in the run so the bars are legible; `fig_trade_table` carries the per-trade
+    numbers for anyone who needs to check a single position.
+
+    This used to be a cumulative-over-time stack of the greek terms plus an approximate
+    "costs" (commission+fees+slippage) that was never reconciled against `pnl` -- on a
+    real run that silently left ~5/6 of the money unexplained (an entry fill happens
+    before the position is ever snapshotted, and an exit fill/settlement happens after
+    the last one, so pure greek attribution structurally cannot see either). The waterfall
+    below is exact by construction: every bar is one column of `result.trades`, and the
+    running total after the last bar equals `sum(pnl)` because that is the bridge identity,
+    not a coincidence of the chart.
+    """
     trades = result.trades
-    title = "Cumulative P&L attribution"
+    title = "P&L bridge: greeks -> execution -> costs -> realized P&L"
     if trades.empty:
         return _empty_fig(title)
-    df = trades.copy()
-    order_col = "exit_date" if df["exit_date"].notna().any() else "entry_date"
-    df = df.sort_values(order_col)
-    df["pnl_costs"] = -(
-        df["commission"].fillna(0) + df["fees"].fillna(0) + df["slippage"].fillna(0)
-    )
-    components = ["pnl_delta", "pnl_gamma", "pnl_vega", "pnl_theta", "pnl_residual", "pnl_costs"]
-    x = df[order_col]
+    totals = {comp: float(trades[comp].fillna(0).sum()) for comp, _ in _BRIDGE_COMPONENTS}
+    total_pnl = float(trades["pnl"].fillna(0).sum())
+
+    labels = [label for _, label in _BRIDGE_COMPONENTS] + ["realized P&L"]
+    values = [totals[comp] for comp, _ in _BRIDGE_COMPONENTS] + [total_pnl]
+    measures = ["relative"] * len(_BRIDGE_COMPONENTS) + ["total"]
+
     fig = _new_fig(title)
-    for comp in components:
-        y = df[comp].fillna(0).cumsum()
-        fig.add_trace(
-            go.Scatter(x=x, y=y, mode="lines", name=comp.replace("pnl_", "").replace("_", " "),
-                       stackgroup="one")
+    fig.add_trace(
+        go.Waterfall(
+            x=labels,
+            y=values,
+            measure=measures,
+            increasing=dict(marker=dict(color=COLORS["positive"])),
+            decreasing=dict(marker=dict(color=COLORS["negative"])),
+            totals=dict(marker=dict(color=COLORS["equity"])),
+            connector=dict(line=dict(color=COLORS["grid"])),
+            text=[f"${v:,.0f}" for v in values],
+            textposition="outside",
         )
-    fig.update_layout(xaxis_title=order_col.replace("_", " "), yaxis_title="Cumulative $ P&L")
+    )
+    fig.update_layout(
+        xaxis_title=None,
+        yaxis_title="$ P&L",
+        showlegend=False,
+    )
     return fig
 
 

@@ -120,13 +120,23 @@ def _make_trades(n: int = 8, seed: int = 0) -> pd.DataFrame:
                 edge_ev=float(rng.uniform(-10, 40)),
                 underlying_entry=underlying_entry,
                 underlying_exit=underlying_exit,
-                pnl_delta=pnl * 0.4,
-                pnl_gamma=pnl * 0.05,
-                pnl_vega=pnl * 0.1,
-                pnl_theta=pnl * 0.5,
-                pnl_residual=pnl * -0.05,
             )
         )
+    # Fabricated but bridge-consistent (STRATEGY.md §8A): costs + execution are set
+    # directly, greek terms absorb the remainder, so `pnl == sum of the bridge columns`
+    # holds exactly here too, same as a real run.
+    for row in rows:
+        row["pnl_costs"] = -(row["commission"] + row["fees"])
+        row["pnl_entry_execution"] = round(row["pnl"] * 0.03, 6)
+        row["pnl_exit_execution"] = round(row["pnl"] * 0.02, 6)
+        remainder = (
+            row["pnl"] - row["pnl_costs"] - row["pnl_entry_execution"] - row["pnl_exit_execution"]
+        )
+        row["pnl_delta"] = remainder * 0.4
+        row["pnl_gamma"] = remainder * 0.05
+        row["pnl_vega"] = remainder * 0.1
+        row["pnl_theta"] = remainder * 0.5
+        row["pnl_residual"] = remainder * -0.05
     df = pd.DataFrame(rows)
     return schema.validate_frame(df, schema.TRADE_DTYPES, "trades")
 

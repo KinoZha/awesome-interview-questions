@@ -184,6 +184,47 @@ def _settle_expiry(pos: Position, S_close: float) -> float:
     return total_per_share * pos.qty * CONTRACT_MULTIPLIER
 
 
+def _entry_exit_execution(pos: Position) -> tuple[float, float]:
+    """The two execution terms of the P&L bridge (STRATEGY.md §8A), in per-share dollars
+    (NOT yet scaled by qty*multiplier -- callers do that, matching the attribution totals'
+    convention).
+
+    Both `entry_cash_actual` and `exit_value_actual` below are actual price-only cash
+    flows (no commission/fees -- those are `pnl_costs`, computed separately), signed with
+    the same "credit positive" convention `Fill.cash` uses (SELL: +price, BUY: -price).
+    That convention is not arbitrary: `_mark_position`'s cost-to-close formula
+    `(-leg.ratio) * mid` is numerically identical to this same signed-price formula
+    evaluated at `mid` -- i.e. `mark(t)` IS "what you'd receive opening this position at
+    time t's mid prices" (CLAUDE.md schema note). That equivalence is what makes the
+    bridge exact: the execution gap at either end is simply the real cash flow minus what
+    the nearest recorded mark implies, with no free "whatever's left over" term.
+    """
+    entry_cash_actual = sum((f.price if f.side == "SELL" else -f.price) for f in pos.open_fills)
+
+    if pos.close_fills:
+        exit_value_actual = sum((f.price if f.side == "SELL" else -f.price) for f in pos.close_fills)
+    else:
+        settlement_cash = pos.meta.get("_settlement_cash", 0.0)
+        exit_value_actual = settlement_cash / (pos.qty * CONTRACT_MULTIPLIER) if pos.qty else 0.0
+
+    # If the position was never marked while open (closed/expired before it was ever
+    # visited by the marking/snapshot steps -- see loop docstring), there is no recorded
+    # mark to measure execution against. Anchoring both ends at 0 puts the entire gap on
+    # `pnl_entry_execution`/`pnl_exit_execution` (greek terms are already 0 in that case)
+    # rather than fabricating a mark -- the identity still closes exactly either way,
+    # since the anchor cancels out of `entry_execution + greek_total + exit_execution`.
+    first_mark = pos.meta.get("_first_mark")
+    last_mark = pos.meta.get("_prev_snap", {}).get("mark") if pos.meta.get("_prev_snap") else None
+    m0 = float(first_mark) if first_mark is not None else 0.0
+    m_last = float(last_mark) if last_mark is not None else 0.0
+
+    # entry_cash_at_mid(t) == mark(t) (see docstring); exit gap uses the mirror identity
+    # exit_cash_at_mid(t) == -mark(t).
+    pnl_entry_execution = entry_cash_actual - m0
+    pnl_exit_execution = exit_value_actual + m_last
+    return pnl_entry_execution, pnl_exit_execution
+
+
 def _trade_row(pos: Position) -> dict:
     all_fills = pos.open_fills + pos.close_fills
     commission = sum(f.commission for f in all_fills)
@@ -213,6 +254,7 @@ def _trade_row(pos: Position) -> dict:
 
     attrib = pos.meta.get("_attrib_totals", {})
     notional = pos.qty * CONTRACT_MULTIPLIER
+    pnl_entry_execution, pnl_exit_execution = _entry_exit_execution(pos)
 
     return {
         "position_id": pos.position_id,
@@ -259,6 +301,10 @@ def _trade_row(pos: Position) -> dict:
         "pnl_vega": attrib.get("d_vega", 0.0) * notional,
         "pnl_theta": attrib.get("d_theta", 0.0) * notional,
         "pnl_residual": attrib.get("d_residual", 0.0) * notional,
+        # Full P&L bridge -- see TRADE_DTYPES / `_entry_exit_execution` docstrings.
+        "pnl_entry_execution": pnl_entry_execution * notional,
+        "pnl_exit_execution": pnl_exit_execution * notional,
+        "pnl_costs": -(commission + fees),
     }
 
 
@@ -395,6 +441,13 @@ def run_backtest(cfg: BacktestConfig, store) -> BacktestResult:
                 incr = attribution_mod.attribute(prev_snap, cur_snap)
             else:
                 incr = {"d_delta": 0.0, "d_gamma": 0.0, "d_vega": 0.0, "d_theta": 0.0, "d_residual": 0.0}
+                # First time this position is ever marked/snapshotted. Greek attribution
+                # can only explain mark movement FROM here on -- pin it as the anchor the
+                # entry-execution bridge term (`_trade_row`) measures the real entry fill
+                # against, since there is never a snapshot on the entry date itself (a
+                # position isn't in `portfolio.positions` for the marking/snapshot steps
+                # on the day it opens -- see loop order in the module docstring).
+                pos.meta["_first_mark"] = cur_snap["mark"]
             totals = pos.meta.setdefault(
                 "_attrib_totals", {"d_delta": 0.0, "d_gamma": 0.0, "d_vega": 0.0, "d_theta": 0.0, "d_residual": 0.0}
             )

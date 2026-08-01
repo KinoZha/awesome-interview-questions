@@ -272,7 +272,7 @@ def build_report(result: "BacktestResult", out_path, *, store=None, extra: dict 
         _block(js.embed(F.fig_equity_curve(result)), "Equity curve"),
         _block(js.embed(F.fig_drawdown(result)), "Drawdown"),
         _block(js.embed(F.fig_monthly_heatmap(result)), "Monthly returns"),
-        _block(js.embed(F.fig_attribution_stack(result)), "P&L attribution (cumulative)"),
+        _block(js.embed(F.fig_attribution_stack(result)), "P&L bridge (greeks -> execution -> costs)"),
     ]
     section_a = f"""
     <section id="section-a" class="odds-section"><div class="container">

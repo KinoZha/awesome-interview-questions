@@ -257,12 +257,32 @@ TRADE_DTYPES: dict[str, str] = {
     "edge_ev": "float64",
     "underlying_entry": "float64",
     "underlying_exit": "float64",
-    # attribution, summed over the life of the trade
+    # attribution, summed over the life of the trade -- greek decomposition of the mark
+    # change between the FIRST and LAST recorded snapshot only (ARCHITECTURE.md §4).
     "pnl_delta": "float64",
     "pnl_gamma": "float64",
     "pnl_vega": "float64",
     "pnl_theta": "float64",
     "pnl_residual": "float64",
+    # The full P&L bridge (STRATEGY.md §8A) closes the rest of the gap the greek terms
+    # above cannot see, because they can only explain mark-to-mid movement *between*
+    # recorded snapshots -- never the entry fill (real bid/ask, on the entry date, before
+    # the position is ever snapshotted) or the exit fill/settlement (real bid/ask or
+    # intrinsic value, after the last snapshot). Each is computed from its own inputs, not
+    # as "whatever is left over":
+    #   pnl_entry_execution = actual entry-fill cash  MINUS  the credit implied by the
+    #     first recorded mark (mid) -- so it also carries any price drift between the
+    #     entry date and the first day the position was marked, since there is no mark
+    #     recorded on the entry date itself.
+    #   pnl_exit_execution  = actual exit-fill cash (or expiry settlement value)  MINUS
+    #     the credit implied by the LAST recorded mark (mid).
+    #   pnl_costs = -(commission + fees), both open and close.
+    # Identity (exact, to float tolerance):
+    #   pnl == pnl_delta + pnl_gamma + pnl_vega + pnl_theta + pnl_residual
+    #          + pnl_entry_execution + pnl_exit_execution + pnl_costs
+    "pnl_entry_execution": "float64",
+    "pnl_exit_execution": "float64",
+    "pnl_costs": "float64",
 }
 
 TRADE_COLUMNS: list[str] = list(TRADE_DTYPES)

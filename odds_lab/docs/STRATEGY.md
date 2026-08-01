@@ -56,6 +56,33 @@ For an underlying `S`, horizon `T` trading days, and a target price `K`:
    - A trade is **eligible only if `edge_ev > 0`** under the empirical distribution.
      This is the single filter that separates this system from naive premium selling.
 
+### 2.1 A result that shapes the whole design
+
+Verified numerically with an independent reference implementation (S=400, IV=16%, 30d,
+short put 380 / long put 375, 1e6 draws):
+
+| terminal distribution (variance matched to IV) | P(short strike ITM) | naked short put EV | 380/375 spread EV |
+|---|---|---|---|
+| lognormal | 0.1345 | +0.003 | +0.002 |
+| Student-t(3) | 0.0770 | +0.175 | +0.226 |
+| 3% chance of a −4σ crash jump | 0.0757 | **−0.444** | **+0.229** |
+
+Two things follow, and both are load-bearing:
+
+1. **"Fat tails" alone do not hurt a premium seller at a 15–30 delta strike.** That strike
+   is only ~1.1σ out. A variance-matched leptokurtic distribution is *more* peaked near the
+   money, so it puts *less* mass beyond the short strike. This is why naive premium selling
+   looks so good for years at a time. Any test asserting "fat tails ⇒ seller loses" is wrong.
+2. **What kills the seller is a crash jump combined with undefined risk.** Same variance,
+   same P(ITM) — the naked put's EV collapses while the defined-risk spread's does not,
+   because the spread's loss is capped at `width − credit`. This is the Barings / Sep-2008
+   argument from the source material, quantified.
+
+So the backtester must (a) measure the edge with a payoff integral over the empirical
+distribution rather than a two-point win/lose approximation, and (b) always report the naked
+variant alongside the defined-risk one, because the difference between them only shows up in
+a handful of months out of twelve years.
+
 ## 3. Strategies to implement
 
 Ordered by priority. All are defined on ETF underlyings (SPY, QQQ, IWM).

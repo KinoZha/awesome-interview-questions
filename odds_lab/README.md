@@ -47,6 +47,14 @@ the report says so loudly.
 Your data never has to leave your machine — GB-scale chain history is ingested locally.
 
 ```bash
+# Have a directory of ThetaData CSV bulk exports (.csv/.csv.gz) but don't know the shapes
+# of everything in it? Profile it first -- reads only headers + a few hundred rows per
+# file, never the whole thing, so this stays fast even on a directory of GB-scale files:
+uv run odds-lab probe --csv /path/to/exports
+uv run odds-lab probe --csv /path/to/exports --sample-out schema-sample.tar.gz  # if a shape
+                                                                                 # comes back
+                                                                                 # `unknown`
+
 # ThetaData CSV exports (a directory of files; .csv and .csv.gz both work)
 uv run odds-lab ingest --provider csv --source /path/to/exports --roots SPY,QQQ,IWM
 
@@ -63,9 +71,22 @@ Two things to get right before a long backtest:
   entry with `no_empirical_dist` — visibly, in the funnel, but you will have wasted the run.
 - **Verify your provider's history floor.** ThetaData's docs conflict on when CTA-tape
   coverage begins: QQQ is confirmed from 2012-06, but SPY and IWM are documented as either
-  2017 or 2020 depending on the page. If yours starts late, the data layer is
-  provider-agnostic — ORATS reaches back to 2007 for EOD — and swapping sources touches no
-  strategy or engine code.
+  2017 or 2020 depending on the page. Don't take either page's word for it — ask your own
+  subscription:
+
+  ```bash
+  # Binary-searches the earliest usable date per (root, data kind) against a live terminal
+  # -- ~10 requests per root, not a day-by-day scan -- and writes a plain-language verdict
+  # ("SPY option EOD usable from 2017-01-03; a backtest starting 2013 is not possible from
+  # this source") to runs/coverage-<timestamp>.md, plus a compact table to stdout.
+  uv run odds-lab probe --coverage --roots SPY,QQQ,IWM
+
+  # Same question, answered for free from a local export directory (no requests):
+  uv run odds-lab probe --coverage --csv /path/to/exports --roots SPY,QQQ,IWM
+  ```
+
+  If yours starts late, the data layer is provider-agnostic — ORATS reaches back to 2007
+  for EOD — and swapping sources touches no strategy or engine code.
 
 ## Reading the report
 

@@ -151,13 +151,60 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 def cmd_probe(args: argparse.Namespace) -> int:
     try:
-        from odds_lab.data.probe import probe
+        from odds_lab.data import probe as probe_mod
     except ImportError as e:
         print(f"error: probe not available yet: {e}", file=sys.stderr)
         return 1
+
+    if args.csv and args.base_url:
+        print(
+            "error: --csv and --base-url are mutually exclusive -- --csv profiles a local "
+            "export directory, --base-url talks to a live Theta Terminal; pick one",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.coverage:
+        if not args.roots:
+            print("error: --coverage requires --roots, e.g. --roots SPY,QQQ,IWM", file=sys.stderr)
+            return 1
+        roots = _split_roots(args.roots)
+        floor = date.fromisoformat(args.floor)
+        ceiling = date.fromisoformat(args.ceiling) if args.ceiling else None
+        if args.csv:
+            path = probe_mod.probe_coverage_csv(args.csv, list(roots))
+        else:
+            path = probe_mod.probe_coverage_rest(
+                args.base_url,
+                args.version,
+                list(roots),
+                floor=floor,
+                ceiling=ceiling,
+                sample_dates=args.sample_dates,
+                rate_limit_per_min=args.rate_limit,
+            )
+        print(f"wrote {path}")
+        return 0
+
+    if args.csv:
+        path = probe_mod.probe_csv(
+            args.csv, head_rows=args.head_rows, tail_rows=args.tail_rows, sample_out=args.sample_out
+        )
+        print(f"wrote {path}")
+        if args.sample_out:
+            print(f"schema sample archive: {args.sample_out} -- send this if a shape came back 'unknown'")
+        return 0
+
+    if not args.root or not args.date:
+        print(
+            "error: --root and --date are required for the REST schema probe "
+            "(or pass --csv <dir> to profile local exports instead)",
+            file=sys.stderr,
+        )
+        return 1
     import json
 
-    result = probe(args.base_url, args.version, args.root, date.fromisoformat(args.date))
+    result = probe_mod.probe(args.base_url, args.version, args.root, date.fromisoformat(args.date))
     print(json.dumps(result, indent=2, default=str))
     return 0
 
@@ -345,11 +392,29 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--version", default="v3", choices=["v2", "v3"])
     p_ingest.set_defaults(func=cmd_ingest)
 
-    p_probe = sub.add_parser("probe", help="dump/diff the live provider schema")
-    p_probe.add_argument("--base-url", required=True)
+    p_probe = sub.add_parser("probe", help="dump/diff the live provider schema, or profile local CSV exports")
+    p_probe.add_argument("--base-url", default=None, help="live Theta Terminal base URL (REST probe / --coverage)")
     p_probe.add_argument("--version", default="v3", choices=["v2", "v3"])
-    p_probe.add_argument("--root", required=True)
-    p_probe.add_argument("--date", required=True, help="YYYY-MM-DD")
+    p_probe.add_argument("--root", default=None, help="REST schema probe only")
+    p_probe.add_argument("--date", default=None, help="YYYY-MM-DD; REST schema probe only")
+    p_probe.add_argument(
+        "--csv", default=None, metavar="DIR",
+        help="profile a directory of ThetaData CSV bulk exports instead of a live REST probe "
+        "(mutually exclusive with --base-url)",
+    )
+    p_probe.add_argument("--sample-out", default=None, metavar="PATH", help="with --csv: write a small schema-sample .tar.gz to PATH")
+    p_probe.add_argument("--head-rows", type=int, default=200, help="with --csv: data rows sampled from the start of each file")
+    p_probe.add_argument("--tail-rows", type=int, default=5, help="with --csv: data rows sampled from the end of each file")
+    p_probe.add_argument(
+        "--coverage", action="store_true",
+        help="binary-search the earliest usable date per (root, data kind) instead of a schema dump "
+        "(works with --base-url or --csv)",
+    )
+    p_probe.add_argument("--roots", default=None, help="--coverage: comma-separated roots, e.g. SPY,QQQ,IWM")
+    p_probe.add_argument("--floor", default="2010-01-01", help="--coverage (REST): earliest date to search from")
+    p_probe.add_argument("--ceiling", default=None, help="--coverage (REST): latest known-good date to search to (default: today-5d)")
+    p_probe.add_argument("--sample-dates", type=int, default=5, help="--coverage (REST): sample dates for the density table")
+    p_probe.add_argument("--rate-limit", type=int, default=20, help="--coverage (REST): max requests/min against the terminal")
     p_probe.set_defaults(func=cmd_probe)
 
     p_bt = sub.add_parser("backtest", help="run a backtest and write runs/<run_id>/")

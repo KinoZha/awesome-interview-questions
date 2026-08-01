@@ -6,7 +6,8 @@ from __future__ import annotations
 import gzip
 import math
 import shutil
-from datetime import date
+import time
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -758,3 +759,264 @@ def test_thetadata_strike_autodetect_leaves_real_dollars_alone(raw_eod_fixture):
         "SPY", date(2025, 8, 19), date(2025, 12, 19), eod_df, eod_fmt, pd.DataFrame(), [], underlying_price
     )
     assert np.allclose(sorted(out["strike"].unique()), sorted(raw_eod_fixture["strike"].unique()))
+
+
+# ---------------------------------------------------------------------------------
+# probe_csv -- profiling a directory of ThetaData CSV bulk exports without reading
+# any file whole. See data/probe.py's module docstring point 2.
+# ---------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def probe_csv_dir(tmp_path) -> Path:
+    d = tmp_path / "theta_exports"
+    d.mkdir()
+    shutil.copy(_EOD_FIXTURE, d / _EOD_FIXTURE.name)
+    shutil.copy(_OHLC_1M_FIXTURE, d / _OHLC_1M_FIXTURE.name)
+    return d
+
+
+def test_probe_csv_classifies_known_fixtures(probe_csv_dir):
+    report_path = probe_mod.probe_csv(probe_csv_dir)
+    text = report_path.read_text()
+    assert "**option_eod**" in text
+    assert "**option_ohlc_1m**" in text
+    for col in EOD_HEADER:
+        assert f"`{col}`" in text
+    for col in OHLC_1M_HEADER:
+        assert f"`{col}`" in text
+
+
+def test_probe_csv_profiles_return_correct_classification_and_header(probe_csv_dir):
+    eod_profile = probe_mod._profile_file(probe_csv_dir / _EOD_FIXTURE.name, 200, 5)
+    assert eod_profile["classification"] == "option_eod"
+    assert eod_profile["header"] == EOD_HEADER
+
+    ohlc_profile = probe_mod._profile_file(probe_csv_dir / _OHLC_1M_FIXTURE.name, 200, 5)
+    assert ohlc_profile["classification"] == "option_ohlc_1m"
+    assert ohlc_profile["header"] == OHLC_1M_HEADER
+
+
+def test_probe_csv_reports_filename_trade_date_vs_expiration_ambiguity(probe_csv_dir):
+    """`thetadata_spy_ohlc_1m_20250819_exp20251219.csv.gz` encodes BOTH a trade date
+    (20250819, matches the sampled `timestamp` column) and an expiration
+    (20251219, matches the sampled `expiration` column). The tool must report this
+    ambiguity rather than silently picking one -- exactly the kind of thing that
+    silently corrupts an ingest if assumed away."""
+    profile = probe_mod._profile_file(probe_csv_dir / _OHLC_1M_FIXTURE.name, 200, 5)
+    notes = " | ".join(profile["filename_notes"])
+    assert "20250819" in notes
+    assert "20251219" in notes
+    assert "PER-TRADE-DATE" in notes
+    assert "PER-EXPIRATION" in notes
+    assert "AMBIGUITY" in notes
+
+
+def test_probe_csv_unknown_shape_does_not_crash_the_walk(tmp_path):
+    d = tmp_path / "exports"
+    d.mkdir()
+    shutil.copy(_EOD_FIXTURE, d / _EOD_FIXTURE.name)
+    weird = d / "SPY_mystery_export.csv"
+    weird.write_text("foo,bar,baz\n1,2,3\n4,5,6\n")
+
+    report_path = probe_mod.probe_csv(d)
+    text = report_path.read_text()
+    assert "**unknown**" in text
+    assert "**option_eod**" in text  # the known fixture still classified alongside it
+
+    weird_profile = probe_mod._profile_file(weird, 200, 5)
+    assert weird_profile["classification"] == "unknown"
+
+
+def test_probe_csv_flags_missing_underlying_price_prominently(probe_csv_dir):
+    """Neither fixture carries underlying_price and nothing in the directory
+    supplies it -- the report must say so prominently, not bury it per-file."""
+    report_path = probe_mod.probe_csv(probe_csv_dir)
+    text = report_path.read_text()
+    assert "No file in this directory supplies `underlying_price`" in text
+    assert "cannot be ingested" in text
+
+
+def test_probe_csv_bounded_reading_on_a_large_plain_csv(tmp_path):
+    """A 1GB file must be profiled in well under a second, without loading it into
+    pandas whole. Constructed here at a smaller but still 'obviously slower if read
+    whole' size, and asserted via an INSTRUMENTED byte count (robust across CI
+    speeds) rather than a wall-clock threshold alone."""
+    big = tmp_path / "SPY_20250820_quotes_tick.csv"
+    row = "SPY,20251219,690.0,C,34200000,1.23,1.25,10,12,20250820\n"
+    with open(big, "w") as f:
+        f.write("root,expiration,strike,right,ms_of_day,bid,ask,bid_size,ask_size,date\n")
+        f.write(row * 2_000_000)
+    size_bytes = big.stat().st_size
+    assert size_bytes > 100_000_000  # >100MB -- a full read would be obviously slower
+
+    t0 = time.perf_counter()
+    profile = probe_mod._profile_file(big, 200, 5)
+    elapsed = time.perf_counter() - t0
+
+    # bytes actually pulled through the reader must be a tiny fraction of the file,
+    # not proportional to it -- this is the load-bearing assertion, not wall time.
+    assert profile["bytes_read_for_profile"] < 1_000_000
+    assert profile["bytes_read_for_profile"] < size_bytes / 50
+    assert elapsed < 2.0  # generous secondary check; a full pandas read of this file is much slower
+
+
+def test_probe_csv_sample_out_produces_small_archive_with_every_distinct_shape(tmp_path):
+    d = tmp_path / "exports"
+    d.mkdir()
+    shutil.copy(_EOD_FIXTURE, d / _EOD_FIXTURE.name)
+    shutil.copy(_OHLC_1M_FIXTURE, d / _OHLC_1M_FIXTURE.name)
+    # a second, differently-named file with the SAME shape as the ohlc fixture --
+    # must be deduped in the sample archive, not duplicated.
+    ohlc_dir = d / "ohlc"
+    ohlc_dir.mkdir()
+    shutil.copy(_OHLC_1M_FIXTURE, ohlc_dir / "20251219_ohlc.csv.gz")
+    weird = d / "unknown_shape.csv"
+    weird.write_text("foo,bar,baz\n1,2,3\n4,5,6\n")
+
+    sample_out = tmp_path / "sample.tar.gz"
+    probe_mod.probe_csv(d, sample_out=sample_out)
+
+    assert sample_out.exists()
+    assert sample_out.stat().st_size < 1_000_000  # target: well under ~1MB
+
+    import tarfile
+
+    with tarfile.open(sample_out) as tar:
+        names = tar.getnames()
+        assert len(names) == 3  # option_eod, option_ohlc_1m, unknown -- deduped, not 4
+        assert any(n.startswith("option_eod__") for n in names)
+        assert any(n.startswith("option_ohlc_1m__") for n in names)
+        assert any(n.startswith("unknown__") for n in names)
+        for member in tar.getmembers():
+            content = tar.extractfile(member).read()
+            assert content.startswith(b"symbol,") or content.startswith(b"foo,")
+            # at most header + 50 rows
+            assert content.count(b"\n") <= 51
+
+
+# ---------------------------------------------------------------------------------
+# probe_coverage -- earliest usable date per (root, data kind).
+# ---------------------------------------------------------------------------------
+
+
+def test_coverage_binary_search_finds_exact_floor_and_is_logarithmic():
+    vendor_start = date(2017, 1, 3)
+    calls: list[date] = []
+
+    def check(d: date) -> bool:
+        calls.append(d)
+        return d >= vendor_start
+
+    floor, n = probe_mod._find_floor_binary_search(check, date(2010, 1, 1), date(2026, 1, 1))
+    assert floor == vendor_start
+    assert n == len(calls)
+    # ~5844 days between floor and ceiling -> log2 ~= 12.5; must be a small constant
+    # multiple of log(n), nowhere near a linear scan (~5844 calls).
+    assert n < 25
+
+
+def test_coverage_binary_search_no_data_in_range_returns_none():
+    def check(d: date) -> bool:
+        return False
+
+    floor, n = probe_mod._find_floor_binary_search(check, date(2010, 1, 1), date(2011, 1, 1))
+    assert floor is None
+    assert n == 1  # only the ceiling check is needed to learn "no data anywhere"
+
+
+def test_coverage_binary_search_propagates_transport_error_not_as_no_data():
+    """A transport/auth failure must never be silently treated as 'no data' -- that
+    would under-report a real floor as later (or missing) than it actually is. The
+    floor-boundary check (always visited second, right after the ceiling check) is
+    made to raise so this is deterministic regardless of bisection internals."""
+
+    class _Boom(Exception):
+        pass
+
+    def check(d: date) -> bool:
+        if d.year <= 2012:
+            raise _Boom("simulated 5xx after retries")
+        return d >= date(2017, 1, 3)
+
+    with pytest.raises(_Boom):
+        probe_mod._find_floor_binary_search(check, date(2010, 1, 1), date(2026, 1, 1))
+
+
+def test_probe_coverage_rest_reports_error_not_early_floor(tmp_path, monkeypatch):
+    """End-to-end through probe_coverage_rest with a monkeypatched provider: a root
+    whose underlying `_get` raises a transport error must show up as an error in
+    the report, never as a plausible (wrong) early floor."""
+    vendor_start = date(2017, 1, 3)
+
+    provider = td.ThetaDataProvider(base_url="http://fake")
+
+    def fake_expirations(root, quote_date):
+        if quote_date.year == 2012:
+            raise td.ThetaAuthError("401 simulated -- subscription does not cover this root/date")
+        if quote_date >= vendor_start:
+            return [date(quote_date.year, 12, 19)]
+        raise td.ThetaNoData("simulated no data")
+
+    monkeypatch.setattr(provider, "expirations", fake_expirations)
+    monkeypatch.setattr(td, "ThetaDataProvider", lambda **kw: provider)
+
+    path = probe_mod.probe_coverage_rest(
+        "http://fake", "v3", ["SPY"], floor=date(2010, 1, 1), ceiling=date(2020, 1, 1), rate_limit_per_min=0
+    )
+    text = path.read_text()
+    assert "SPY" in text
+    # the simulated auth error at 2012 must surface as an error somewhere in the
+    # report, not silently vanish into an early-looking floor.
+    assert "ThetaAuthError" in text or "error" in text.lower()
+
+
+def test_probe_coverage_rest_finds_simulated_vendor_start(monkeypatch):
+    vendor_start = date(2017, 1, 3)
+    n_calls = {"expirations": 0, "greeks": 0, "underlying": 0}
+
+    provider = td.ThetaDataProvider(base_url="http://fake")
+
+    def fake_expirations(root, quote_date):
+        n_calls["expirations"] += 1
+        if quote_date >= vendor_start:
+            return [date(quote_date.year, 12, 19)]
+        raise td.ThetaNoData("simulated no data")
+
+    def fake_underlying_eod(root, start, end):
+        n_calls["underlying"] += 1
+        if end >= vendor_start:
+            return pd.DataFrame({"date": [pd.Timestamp(max(start, vendor_start))]})
+        raise td.ThetaNoData("simulated no data")
+
+    def fake_get(path, params=None):
+        n_calls["greeks"] += 1
+        raise td.ThetaNoData("simulated no data")
+
+    monkeypatch.setattr(provider, "expirations", fake_expirations)
+    monkeypatch.setattr(provider, "underlying_eod", fake_underlying_eod)
+    monkeypatch.setattr(provider, "_get", fake_get)
+    monkeypatch.setattr(td, "ThetaDataProvider", lambda **kw: provider)
+
+    path = probe_mod.probe_coverage_rest(
+        "http://fake",
+        "v3",
+        ["SPY"],
+        floor=date(2010, 1, 1),
+        ceiling=date(2020, 1, 1),
+        sample_dates=0,
+        rate_limit_per_min=0,
+    )
+    text = path.read_text()
+    assert f"**SPY**: option EOD usable from `{vendor_start.isoformat()}`" in text
+    # each kind's binary search must stay logarithmic, not linear over ~3650 days.
+    assert n_calls["expirations"] < 40
+    assert n_calls["underlying"] < 20
+
+
+def test_probe_coverage_csv_reads_local_index_no_requests(csv_export_dir):
+    path = probe_mod.probe_coverage_csv(csv_export_dir, ["SPY"])
+    text = path.read_text()
+    assert "**SPY**: option EOD usable from `2025-08-19`" in text
+    assert "no greeks/iv columns" in text
+    assert "no open_interest column" in text

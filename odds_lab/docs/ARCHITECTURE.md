@@ -116,6 +116,56 @@ Facts confirmed by measuring the fixtures, and what they mean for every consumer
   but is off by default and stamps `source="csv_export+parity"` when used so it can
   never be mistaken for a real quote.
 
+**Probing a real export directory (`odds-lab probe --csv <dir>`).** The user's real
+chain history never touches this sandbox -- hundreds of MB to GB of files on their own
+machine, only two of whose shapes (EOD chain, per-expiration 1-minute OHLC) are
+confirmed above. `data/probe.py::probe_csv` walks a directory recursively (following
+`ohlc/`-style subdirs), and for every `.csv`/`.csv.gz` reads only the header + first
+`N` rows (default 200) plus a small tail sample -- never the whole file (a 1GB file
+profiles in well under a second; verified with an instrumented byte-count assertion,
+not just a wall-clock guess). Per file it reports: exact header, inferred dtypes,
+first 3 rows, an ESTIMATED total row count (bytes / avg sampled row length, gzip
+files use the ISIZE trailer for the true uncompressed size, not the compressed size
+on disk), and the min/max of any date-like sampled column. It CLASSIFIES each file
+by header column set alone -- `option_eod`/`option_ohlc_1m` are exact matches to the
+confirmed shapes above; `option_quote_1m`/`option_trade`/`option_quote_tick`/
+`stock_eod` are UNVERIFIED heuristic guesses (no committed fixture covers them) and
+are labelled as such; anything else is `unknown`. Filename YYYYMMDD tokens are
+checked against the sampled columns and reported as "matches expiration" /
+"matches trade date" / neither -- and explicitly flagged as an AMBIGUITY when a
+filename carries tokens that resolve to different roles (the real ohlc fixture name,
+`..._20250819_exp20251219.csv.gz`, encodes both a trade date and an expiration; the
+tool must say so, not silently pick one). Per file it also reports what's missing
+relative to `schema.CHAIN_REQUIRED` and to what the engine needs (`underlying_price`,
+`open_interest`, greeks), which other file in the directory could supply it, and --
+prominently, at the top of the report -- if nothing in the directory supplies
+`underlying_price` at all (the chain cannot be ingested without it). Writes
+`runs/probe-csv-<timestamp>.md`; `--sample-out <path>` additionally writes a small
+gzip archive (header + first 50 rows per distinct shape, deduped, target under ~1MB)
+to send back when a shape comes back `unknown`.
+
+**History-floor coverage (`odds-lab probe --coverage --roots ...`).** ThetaData's
+docs conflict on when SPY/IWM (CTA tape) coverage starts -- 2017 vs 2020 -- while
+QQQ (UTP tape) is documented from 2012-06; this is not resolvable from this sandbox
+(no outbound network). `data/probe.py::probe_coverage_rest` answers it against a
+live terminal by BINARY-SEARCHING the earliest usable date per (root, data kind) --
+O(log days) requests, not a linear day-by-day scan -- for option EOD, option greeks,
+and underlying/stock EOD independently, since they do not share a floor;
+`open_interest` shares option_eod's floor by construction (it travels inside that
+payload, not behind its own endpoint). A handful of sample dates spread across the
+found range report contract/expiration counts, so a technically-non-empty-but-3-
+strikes floor is visible rather than reported as usable. Requests are paced to a
+configurable rate (default ~20/min) and the total request budget is printed before
+any request is made. `probe_coverage_csv` answers the same question for a local
+export directory for free, by reading its own date index -- no requests, and it says
+plainly when a kind (greeks, open interest) isn't answerable from that export shape
+at all. Both write `runs/coverage-<timestamp>.md` plus a compact stdout table.
+Binary search assumes coverage-start is monotonic in calendar date; a closed-market
+weekend always reads as "no data" regardless of vendor coverage, which can bias a
+search midpoint that lands on one -- `_nudge_to_weekday` reduces but does not
+eliminate this (holidays remain a gap). Treat a reported floor as accurate to within
+a few days, not to the day, and cross-check it against the sample-density table.
+
 **Open-interest-unknown policy.** The EOD export has no `open_interest` column at
 all. `CostModel.min_open_interest` (default 100, `strategy/selector.py`) rejects
 the short leg whenever `open_interest < min_open_interest` -- if a provider

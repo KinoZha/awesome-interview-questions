@@ -1,0 +1,74 @@
+# odds_lab example run configuration.
+#
+# Every knob here maps 1:1 to a field in src/odds_lab/config.py -- that module is the
+# single source of truth; this file only documents its defaults and legal values.
+# Load with `odds-lab backtest --config config.example.yaml [--flag-overrides ...]`,
+# or `BacktestConfig.from_dict(yaml.safe_load(open(...)))`.
+# CLI flags passed alongside --config override the matching value below.
+
+roots: [SPY, QQQ, IWM]          # underlyings to trade
+start: 2012-06-01               # backtest window start (date)
+end: 2026-01-01                 # backtest window end (date)
+label: ""                       # free-text tag shown in the report header
+
+risk_free_rate: 0.02            # flat fallback `r`; overridden per-date if the store has a rate curve
+
+entry:                                    # STRATEGY.md §4
+  strategy: put_credit_spread             # one of: put_credit_spread, call_credit_spread,
+                                           #   iron_condor, short_strangle, short_put, long_strangle
+  strike_rule: delta                      # one of: delta | pct_otm | empirical_prob
+  delta_min: 0.15                         # strike_rule=delta: |short delta| lower bound (OPI: 0.15-0.30)
+  delta_max: 0.30                         # strike_rule=delta: |short delta| upper bound
+  pct_otm: 0.05                           # strike_rule=pct_otm: the "+-5%/80%" baseline rule
+  target_prob_itm: 0.20                   # strike_rule=empirical_prob: target empirical P(ITM)
+  width_strikes: 1                        # spread width in strike increments; sweep over {1,2,3,5}
+  dte_min: 21                             # entry DTE lower bound (OPI)
+  dte_max: 56                             # entry DTE upper bound (OPI)
+  min_credit: 0.30                        # minimum net credit per spread, $
+  expected_return_min: 0.0                # ER = credit / (width - credit); lower bound
+  expected_return_max: 0.50               # ER upper bound
+  market_filter: all                      # one of: all | skip_bearish | skip_bullish | trend_aligned
+  require_positive_edge: true             # reject trades whose empirical edge_ev <= 0 (the ODDS filter)
+  entry_schedule: weekly                  # one of: weekly | monthly_expiry | daily
+  entry_weekday: 0                        # 0=Monday, used when entry_schedule=weekly
+  max_concurrent_per_root: 4              # cap on simultaneously open positions per underlying
+
+exits:                                    # STRATEGY.md §5 -- all enabled rules evaluated, first wins
+  profit_target_pct: 0.50                 # close at X% of credit captured; null to disable
+  stop_loss_multiple: 2.0                 # close when loss = N x credit received; null to disable
+  dte_exit: 21                            # close at this many DTE remaining; null to disable
+  delta_breach: 0.50                      # close when short-strike |delta| >= this; null to disable
+  hold_to_expiry: false                   # if true, ignore all of the above and settle at expiry
+
+risk:                                     # STRATEGY.md §6
+  starting_equity: 100000.0               # $
+  risk_pct_per_trade: 0.05                # fraction of equity risked per trade (5-10% range)
+  max_pct_per_style: 0.50                 # cap on equity allocated to one trade style at once
+  max_margin_pct: 0.60                    # cap on total margin utilization
+  min_contracts: 1
+  max_contracts: 100
+
+costs:                                    # STRATEGY.md §7.1-7.2
+  commission_per_contract: 0.65           # $, both open and close
+  fees_per_contract_sell: 0.05            # $, exchange/regulatory, sells only
+  fill_kind: bid_ask                      # one of: bid_ask | mid | mid_plus_frac
+  mid_frac: 0.5                           # fill_kind=mid_plus_frac: fraction of half-spread paid
+  max_spread_pct_of_mid: 0.15             # reject a contract whose spread/mid exceeds this
+  min_bid: 0.05                           # reject a contract quoting below this bid
+  min_open_interest: 100                  # reject a contract below this OI
+
+empirical:                                # STRATEGY.md §2 step 2, the "Count" half of the edge
+  lookback_years: 10.0                    # trailing window of underlying closes used
+  symmetrize: true                        # union {r_i} with {-r_i}, drift-centered (Casino Secret p.59)
+  min_samples: 250                        # minimum overlapping windows required, else raise
+  bootstrap_samples: 500                  # stationary-bootstrap resamples for the CI
+  bootstrap_mean_block: null              # null => equal to the horizon in trading days
+  seed: 20120601                          # RNG seed, for determinism (CLAUDE.md rule 5)
+
+data:
+  provider: parquet                       # one of: thetadata | parquet | synthetic
+  theta_base_url: http://127.0.0.1:25503  # Theta Terminal REST endpoint
+  theta_api_version: v3                   # one of: v3 | v2
+  store_root: data                        # parquet store root directory
+  allow_synthetic: false                  # must be explicitly true to run on generated data;
+                                           # every report is then stamped SYNTHETIC (non-negotiable)

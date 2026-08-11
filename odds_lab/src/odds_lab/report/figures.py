@@ -41,6 +41,9 @@ __all__ = [
     "fig_year_week_calendar",
     "fig_strategy_comparison",
     "fig_selection_funnel",
+    "fig_stress_scenario_pnl",
+    "fig_stress_worst_position",
+    "fig_stress_odds_overlay",
 ]
 
 # --------------------------------------------------------------------------------------
@@ -789,6 +792,81 @@ def fig_strategy_comparison(results: dict[str, "BacktestResult"]) -> go.Figure:
 # --------------------------------------------------------------------------------------
 # Selection funnel -- "why did propose_trade discard almost everything" (STRATEGY.md §8)
 # --------------------------------------------------------------------------------------
+
+
+def fig_stress_scenario_pnl(comparisons: pd.DataFrame) -> go.Figure:
+    """Scenario P&L, defined-risk vs undefined-risk, side by side -- the headline output
+    of `engine.stress` (STRATEGY.md §10.3 / §2.1)."""
+    title = "Crisis stress: defined-risk vs undefined-risk P&L per scenario"
+    if comparisons is None or comparisons.empty:
+        return _empty_fig(title, "No stress scenarios were built -- see the manifest for why each was skipped")
+    df = comparisons.sort_values("scenario")
+    fig = _new_fig(title)
+    fig.add_trace(
+        go.Bar(x=df["scenario"], y=df["defined_pnl"], name="Defined-risk (spread)",
+               marker=dict(color=COLORS["equity"]),
+               text=[f"n={int(n)}" for n in df["n_positions_defined"]], textposition="outside")
+    )
+    fig.add_trace(
+        go.Bar(x=df["scenario"], y=df["undefined_pnl"], name="Undefined-risk (naked)",
+               marker=dict(color=COLORS["negative"]),
+               text=[f"n={int(n)}" for n in df["n_positions_undefined"]], textposition="outside")
+    )
+    fig.update_layout(barmode="group", xaxis_title="scenario", yaxis_title="total replayed P&L ($)")
+    return fig
+
+
+def fig_stress_worst_position(comparisons: pd.DataFrame) -> go.Figure:
+    """Worst single position's P&L per scenario, defined vs undefined -- the "how bad can
+    one trade get" waterfall STRATEGY.md §10.3 asks for."""
+    title = "Crisis stress: worst single position per scenario"
+    if comparisons is None or comparisons.empty:
+        return _empty_fig(title, "No stress scenarios were built")
+    df = comparisons.sort_values("undefined_worst_position")
+    labels = list(df["scenario"])
+    fig = _new_fig(title)
+    fig.add_trace(
+        go.Waterfall(
+            name="defined-risk worst position", x=[f"{s} (defined)" for s in labels], y=df["defined_worst_position"],
+            measure=["relative"] * len(labels),
+            increasing=dict(marker=dict(color=COLORS["positive"])),
+            decreasing=dict(marker=dict(color=COLORS["warning"])),
+            text=[f"${v:,.0f}" for v in df["defined_worst_position"]], textposition="outside",
+        )
+    )
+    fig.add_trace(
+        go.Waterfall(
+            name="undefined-risk worst position", x=[f"{s} (undefined)" for s in labels], y=df["undefined_worst_position"],
+            measure=["relative"] * len(labels),
+            increasing=dict(marker=dict(color=COLORS["positive"])),
+            decreasing=dict(marker=dict(color=COLORS["negative"])),
+            text=[f"${v:,.0f}" for v in df["undefined_worst_position"]], textposition="outside",
+        )
+    )
+    fig.update_layout(yaxis_title="worst single position P&L ($)", showlegend=True)
+    return fig
+
+
+def fig_stress_odds_overlay(
+    closes: pd.Series, horizon: int, iv: float, asof, scenarios: dict, *, strikes: list[float] | None = None,
+) -> go.Figure:
+    """The ODDS chart (`fig_odds_distribution`) with each crisis scenario's `horizon`-day
+    cumulative log return overlaid as a vertical marker, so the user can see where the
+    crisis sits relative to the strikes they were selling (STRATEGY.md §10.5 / §8C)."""
+    fig = fig_odds_distribution(closes, horizon, iv, asof, strikes=strikes)
+    if not scenarios:
+        return fig
+    for name, sc in scenarios.items():
+        n = min(horizon, sc.n_days)
+        if n <= 0:
+            continue
+        lr = float(np.sum(sc.daily_log_returns[:n]))
+        fig.add_vline(
+            x=lr, line=dict(color=COLORS["negative"], width=2, dash="dashdot"),
+            annotation_text=name, annotation_position="bottom", annotation_textangle=-90,
+        )
+    fig.update_layout(title=fig.layout.title.text + " + crisis scenario overlays")
+    return fig
 
 
 def fig_selection_funnel(result: "BacktestResult") -> go.Figure:

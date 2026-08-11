@@ -209,6 +209,55 @@ the trailing 252 days, and the `IV − realized vol` spread (the direct edge pro
 | `delta_breach` | close when short-strike \|Δ\| ≥ 0.50 | |
 | combined | profit_target OR stop_loss OR dte_exit, whichever first | production default |
 
+### 5.1 Intraday exit evaluation (1-minute option QUOTE data, opt-in)
+
+EOD-only exit evaluation is directionally biased for `stop_loss`/`delta_breach`: an
+intraday spike that would have stopped the position out but reverts by the close is
+invisible to a once-a-day check, which **flatters stop-loss strategies on a
+mean-reverting index** (the loss the EOD backtest reports is systematically smaller
+than what a real intraday-monitored account would have realized). §9's "no intraday
+in v1" restriction applied to entries only and always said the data layer must not
+preclude adding it -- `IntradayConfig` (`config.py`) is that: OFF by default, so
+every existing config/run is unaffected.
+
+When enabled (`cfg.intraday.enabled=True`), `profit_target`, `stop_loss`, and
+`delta_breach` gain a minute-resolution path (`engine/intraday.py`); `dte_exit`
+stays daily-only, unconditionally, because it is defined in terms of calendar days
+remaining, not a market-observable price level. The trigger/fill discipline from
+§7.3 extends unchanged to minute granularity: trigger on bar *i*, fill on bar
+*i+1*, never the triggering bar itself. Delta for `delta_breach` is not present in
+a 1-minute option QUOTE export (bid/ask only, no vendor greeks) -- it is
+recomputed per bar by inverting IV from the leg's own quoted mid via `quant.bs`,
+holding the day's EOD underlying price constant through the day (a documented
+approximation: a quote-only export carries no per-minute underlying print).
+
+**Two-pass hybrid, not a full intraday ingest.** A full 1-minute chain ingest for
+SPY/QQQ/IWM over 12 years is on the order of 1.4 TB (289 MB/day for SPY alone,
+per-vendor file sizes) and is not built by this feature. Instead:
+
+1. **Pass 1** runs the backtest exactly as documented above (EOD chains, daily exit
+   checks) to determine the set of contracts actually held and the dates each was
+   held -- roughly 1,200 trades x up to 4 legs x ~30 holding days each.
+2. **Pass 2** fetches/reads 1-minute QUOTES only for that set (~1-2 GB, not 1.4 TB)
+   and re-runs with intraday exit evaluation for the contract-days that coverage
+   exists for.
+
+Because an intraday exit can move an exit date, which changes concurrent-position
+counts/margin, which can admit or reject different later entries, which changes
+the held-contract set pass 2 needed data for, `engine.intraday.run_hybrid_backtest`
+**iterates to a fixed point** on the held-contract-day set (capped at
+`IntradayConfig.iteration_cap`, default 3) rather than assuming one pass-2 fetch is
+automatically sufficient. Non-convergence is reported, never hidden
+(`manifest['intraday']['hybrid']['converged']`), and every run's manifest states
+exactly which contract-days were evaluated intraday and which fell back to
+EOD-only (`manifest['intraday']`) -- a silently mixed-resolution backtest is worse
+than a consistent one.
+
+**Measuring the bias is the point.** `engine.intraday.compare_eod_vs_intraday` runs
+the same config both ways (EOD-only vs. intraday) and reports, per exit rule, how
+many exits changed, how exit dates shifted, and the resulting P&L difference --
+this is the number that justifies buying 1-minute data in the first place.
+
 Assignment: American-style ETF options. If the short leg is ITM at expiry it is
 assigned; spread legs are exercised/assigned together (auto-exercise if ITM by
 $0.01 per OCC rules). Early assignment must be modeled around ex-dividend dates for
@@ -279,3 +328,93 @@ x-axis. This is literally the "see your edge" picture and it must be reproduced.
 - No single-stock universe / industry momentum screen (OPI §1) in v1 — ETFs only.
 - No live trading, no broker integration.
 - No intraday entries in v1 (EOD granularity); the data layer must not preclude it.
+
+## 10. Crisis stress (`engine/stress.py`) — 2008 without 2008 option data
+
+The user's option-chain history starts around 2012-2013, so a real backtest cannot trade
+through the 2008-09 crisis. That does not make the crisis risk untestable: §2 step 2
+("Count") is built from UNDERLYING CLOSES ONLY, which are free and long-history —
+SPY back to 1993, the S&P 500 index itself back to the 1950s (exactly what *Casino
+Secret* pp.49-65 charts). Option chains are the expensive, short-history dataset;
+realized returns are the cheap, long-history one. `engine/stress.py` uses that asymmetry
+to answer: *what would the positions this backtest actually held have done, had the
+underlying moved the way it did in a crisis the option data does not cover?*
+
+### 10.1 Scenario library
+
+Scenarios are REALIZED underlying paths, never invented shocks, and are always derived
+from a caller-supplied long close series (`engine.stress.load_underlying_history`) — a
+scenario whose window the series does not cover is skipped and reported in
+`ScenarioLibrary.skipped`, never approximated or fabricated. The default library:
+
+| name | window | category |
+|---|---|---|
+| `1987-10` | Oct 1987 | historical (out of the user's data) |
+| `2000-02` | Mar 2000 – Oct 2002 | historical |
+| `2008-09` | Sep 2008 – Mar 2009 | historical |
+| `2008-09-worst-{21,30,45}d` | worst N-trading-day window inside 2008-09 | historical |
+| `2011-08` | Jul – Oct 2011 | historical |
+| `2018-02` | Jan 26 – Feb 12 2018 | calibration (IS in the user's data) |
+| `2020-03` | Feb 15 – Apr 15 2020 | calibration (IS in the user's data) |
+
+The two calibration scenarios exist so the replay's numbers can be sanity-checked against
+what the real backtest actually did over the same calendar period, before trusting the
+out-of-sample historical ones.
+
+**Free sources** for the long close series: SPY daily closes back to 1993 from Stooq
+(`https://stooq.com/q/d/l/?s=spy.us&i=d`) or Yahoo Finance; the S&P 500 index itself
+(`^GSPC`) back to the 1950s from Stooq (`^spx`) or a downloaded Yahoo/Cboe series.
+
+### 10.2 The IV-mapping assumption
+
+A scenario only specifies how the underlying moved; repricing an option along that path
+needs an implied vol at every step. `engine.stress.scenario_iv` maps the scenario's
+realized-vol expansion onto the position's entry IV:
+
+    vol_expansion = scenario.realized_vol / scenario.baseline_vol   (crisis RV / 60d-pre-crisis calm RV)
+    iv_scenario   = iv_entry * vol_expansion * beta
+
+`beta` (default `DEFAULT_IV_BETA = 1.3`) is the IV/RV overshoot calibration constant —
+during a real crisis, IV (panicked, forward-looking) historically runs ABOVE trailing
+realized vol (e.g. VIX ~80 vs trailing-30d SPX RV ~65-70 at the Oct 2008 peak). This is
+the single biggest modelling assumption in the module: it is not buried, it is a named
+parameter, and `run_stress` sweeps `IV_BETA_SENSITIVITY_RANGE = (0.8, 1.0, 1.3, 1.6,
+2.0)` by default so the report shows how far the P&L numbers move as it varies.
+
+### 10.3 Position replay + the comparison that matters
+
+Every position a run actually opened is replayed from its own entry date along each
+scenario's path, using `quant.bs` with `scenario_iv` and the exact exit policy the run
+used (`strategy.exits.evaluate_exit`, unmodified) — profit target / stop loss / delta
+breach / DTE exit, first trigger wins, same as the live loop. Each replayed position is
+run BOTH as the defined-risk structure the backtest actually took AND as its undefined-risk
+sibling (long leg dropped, same short strike) — this is the §2.1 comparison, evaluated on
+real crisis paths instead of a synthetic jump. `run_stress` reports, per scenario: total
+P&L, max drawdown, worst single position, an (upper-bound, per-position-peak-summed)
+margin peak, and how many positions breached their short strike — for both variants, so
+the divergence (or its absence) is a number in the table, not an assertion.
+
+### 10.4 Feeding the long history into the edge itself
+
+`engine.stress.LongHistoryStore` wraps a `ChainStore`, substituting a supplied long close
+series for the "Count" step (`store.closes()`, the only read `build_empirical` depends
+on) while every other read passes through unchanged.
+`run_backtest_with_long_history(cfg, store, long_closes)` runs the SAME config against
+the SAME option chains twice — once against the store's native short history, once
+against the long one — and reports the trade-count and P&L delta. If a materially larger
+fraction of candidates gets rejected on `negative_edge` once 2008 is inside the empirical
+window, that is a real finding about `require_positive_edge`'s sensitivity to lookback
+length, not a bug.
+
+### 10.5 CLI
+
+```
+odds-lab stress --run <run_dir> --underlying-history <csv> [--scenarios a,b,c] [--store <store_dir>]
+```
+
+Writes `<run_dir>/stress/{replays,comparisons,beta_sensitivity}.parquet` +
+`manifest.json`, and rewrites `<run_dir>/report.html` with a new "F. Crisis stress"
+section: scenario P&L bars (defined vs undefined side by side), the worst-position
+waterfall, an ODDS-chart overlay showing where each scenario's realized move sits
+relative to the strikes actually traded, the beta-sensitivity table, and (when `--store`
+is given) the long-window empirical-distribution comparison from §10.4.

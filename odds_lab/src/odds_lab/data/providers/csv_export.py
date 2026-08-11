@@ -85,6 +85,7 @@ __all__ = [
     "EOD_HEADER",
     "OHLC_1M_HEADER",
     "read_ohlc_1m_csv",
+    "read_quote_1m_csv",
 ]
 
 
@@ -172,6 +173,123 @@ def read_ohlc_1m_csv(path: str | Path, chunksize: int = 250_000) -> pd.DataFrame
     if not chunks:
         return pd.DataFrame(columns=[*OHLC_1M_HEADER, "all_zero_bar", "price"])
     return pd.concat(chunks, ignore_index=True)
+
+
+_QUOTE_1M_ALIASES: dict[str, set[str]] = {
+    "symbol": {"symbol", "root", "underlying", "ticker"},
+    "expiration": {"expiration", "expiry"},
+    "strike": {"strike"},
+    "right": {"right", "option_type", "call_put"},
+    "timestamp": {"timestamp", "datetime", "quote_ts"},
+    "date": {"date", "quote_date", "trade_date"},
+    "ms_of_day": {"ms_of_day", "time_ms", "millis"},
+    "bid": {"bid", "bid_price"},
+    "ask": {"ask", "ask_price"},
+    "bid_size": {"bid_size", "bidsize"},
+    "ask_size": {"ask_size", "asksize"},
+}
+"""Alias set per canonical field for `read_quote_1m_csv`. UNVERIFIED against any
+real fixture (see that function's docstring) -- this is a defensive best guess at
+naming variants, not a confirmed vendor schema. Extend this dict, not the parsing
+logic, if a real export uses a name not listed here."""
+
+
+def read_quote_1m_csv(path: str | Path, chunksize: int = 250_000) -> pd.DataFrame:
+    """Load a ThetaData 1-minute option QUOTE bulk export into odds_lab's own
+    normalized intraday-quote shape (`data/store.py::INTRADAY_DTYPES` columns, minus
+    `is_synthetic`/`source` which the caller stamps).
+
+    UNVERIFIED (ARCHITECTURE.md §0.5 "Schema is probed, not assumed"): only
+    `option_eod` (`EOD_HEADER`) and `option_ohlc_1m` (`OHLC_1M_HEADER`, 1-minute
+    TRADE bars) are confirmed against a real committed fixture. NO real 1-minute
+    option QUOTE fixture has ever been committed here, so this reader does not
+    hardcode a guessed column list as if it were ground truth the way `EOD_HEADER`/
+    `OHLC_1M_HEADER` are -- it is header-driven and defensive instead:
+
+      1. Classify the file by its header COLUMN SET via the SAME machinery
+         `data/probe.py` uses for exactly this situation (`probe._classify`,
+         never by filename) -- must come back `option_quote_1m` or
+         `option_quote_tick`.
+      2. Resolve each canonical field (`_QUOTE_1M_ALIASES`) against a small alias
+         set so minor vendor naming differences don't hard-fail.
+      3. If the header doesn't classify as a quote shape, OR a required field
+         (expiration/strike/right/bid/ask, and either `timestamp` or `date`)
+         doesn't resolve, raise `CsvExportError` NAMING THE EXACT COLUMNS FOUND --
+         never guess and never silently proceed with a wrong mapping.
+
+    Confirm this against a real export with `odds-lab probe --csv <dir>` (which
+    will report the file as `option_quote_1m`/`option_quote_tick`, both flagged
+    UNVERIFIED there too) before trusting it operationally, and update this
+    docstring + `_QUOTE_1M_ALIASES` together once a real fixture is available --
+    exactly the workflow `thetadata.py`'s REST/JSON path documents for itself.
+    """
+    from odds_lab.data.probe import _classify  # lazy: avoids a probe<->csv_export import cycle
+
+    path = Path(path)
+    header = list(_read_csv(path, nrows=0).columns)
+    kind, reason = _classify(header)
+    if kind not in ("option_quote_1m", "option_quote_tick"):
+        raise CsvExportError(
+            f"{path}: header does not look like a 1-minute option quote export -- "
+            f"data/probe.py classified it as {kind!r} ({reason}); found columns: {header}"
+        )
+
+    lower = {c.strip().lower(): c for c in header}
+
+    def _resolve(canonical: str) -> str | None:
+        for alias in _QUOTE_1M_ALIASES[canonical]:
+            if alias in lower:
+                return lower[alias]
+        return None
+
+    resolved = {name: _resolve(name) for name in _QUOTE_1M_ALIASES}
+    required = ["expiration", "strike", "right", "bid", "ask"]
+    missing = [name for name in required if resolved[name] is None]
+    if resolved["timestamp"] is None and resolved["date"] is None:
+        missing.append("timestamp (or date[+ms_of_day])")
+    if missing:
+        raise CsvExportError(
+            f"{path}: 1-minute option quote export (classified {kind!r}) is missing "
+            f"required field(s) {missing} -- no alias in {_QUOTE_1M_ALIASES} matched; "
+            f"found columns: {header}"
+        )
+
+    col_symbol, col_expiration, col_strike, col_right = (
+        resolved["symbol"], resolved["expiration"], resolved["strike"], resolved["right"],
+    )
+    col_ts, col_date, col_ms = resolved["timestamp"], resolved["date"], resolved["ms_of_day"]
+    col_bid, col_ask = resolved["bid"], resolved["ask"]
+    col_bid_size, col_ask_size = resolved["bid_size"], resolved["ask_size"]
+
+    out_cols = ["root", "expiry", "strike", "right", "quote_date", "ts", "bid", "ask", "bid_size", "ask_size"]
+    chunks: list[pd.DataFrame] = []
+    for chunk in _read_csv(path, chunksize=chunksize):
+        right = _map_right(chunk[col_right])
+        if col_ts is not None:
+            ts = pd.to_datetime(chunk[col_ts])
+        else:
+            base = pd.to_datetime(chunk[col_date])
+            ms = chunk[col_ms].astype("int64") if col_ms is not None else 0
+            ts = base + pd.to_timedelta(ms, unit="ms")
+        chunks.append(
+            pd.DataFrame(
+                {
+                    "root": chunk[col_symbol].astype(str) if col_symbol is not None else pd.NA,
+                    "expiry": pd.to_datetime(chunk[col_expiration]),
+                    "strike": chunk[col_strike].astype(float),
+                    "right": right,
+                    "quote_date": pd.to_datetime(ts.dt.date),
+                    "ts": ts,
+                    "bid": chunk[col_bid].astype(float),
+                    "ask": chunk[col_ask].astype(float),
+                    "bid_size": chunk[col_bid_size].astype("int32") if col_bid_size is not None else 0,
+                    "ask_size": chunk[col_ask_size].astype("int32") if col_ask_size is not None else 0,
+                }
+            )
+        )
+    if not chunks:
+        return pd.DataFrame(columns=out_cols)
+    return pd.concat(chunks, ignore_index=True)[out_cols]
 
 
 @dataclass

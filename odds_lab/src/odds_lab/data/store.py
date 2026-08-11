@@ -28,14 +28,72 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 from odds_lab import schema
 
-__all__ = ["ChainStore"]
+__all__ = ["ChainStore", "INTRADAY_DTYPES"]
 
 _CHAIN_KEY = ["root", "quote_date", "expiry", "strike", "right"]
 _UNDERLYING_KEY = ["root", "date"]
+
+INTRADAY_DTYPES: dict[str, str] = {
+    "root": "string",
+    "expiry": "datetime64[ns]",
+    "strike": "float64",
+    "right": "string",  # 'C' | 'P'
+    "quote_date": "datetime64[ns]",
+    "ts": "datetime64[ns]",  # full minute-resolution timestamp
+    "bid": "float64",
+    "ask": "float64",
+    "bid_size": "int32",
+    "ask_size": "int32",
+    "source": "string",
+    "is_synthetic": "bool",
+}
+"""1-minute option QUOTE contract for the intraday-exit feature (task brief). Lives
+here, not in `schema.py`: this change's edit scope is `data/store.py` +
+`engine/*`/`config.py`/`cli.py`/`strategy/exits.py` only, and `schema.py` is out of
+scope (owned/concurrently edited elsewhere) -- exactly the precedent
+`engine/loop.py::FUNNEL_DTYPES` already sets for a table that doesn't belong in the
+cross-module schema contract. Keyed on (root, expiry, strike, right, quote_date, ts).
+
+The real ThetaData 1-minute QUOTE export schema is UNVERIFIED (ARCHITECTURE.md §0.5
+only confirms `option_eod` and `option_ohlc_1m`/1-minute TRADE bars) -- this table's
+shape is odds_lab's own normalized/canonical intraday-quote representation that
+`data/providers/csv_export.py::read_quote_1m_csv` and
+`data/providers/synthetic.py::SyntheticProvider.intraday_quotes` both produce rows
+for; it is not itself a claim about the vendor's on-disk column names."""
+
+_INTRADAY_KEY = ["root", "expiry", "strike", "right", "quote_date", "ts"]
+
+
+def _validate_intraday(df: pd.DataFrame) -> pd.DataFrame:
+    """Local, lightweight analog of `schema.validate_chain` for `INTRADAY_DTYPES`
+    (kept here rather than in `schema.py` -- see `INTRADAY_DTYPES` docstring)."""
+    missing = [c for c in INTRADAY_DTYPES if c not in df.columns]
+    if missing:
+        raise schema.SchemaError(f"intraday quotes missing columns: {missing}")
+    extra = [c for c in df.columns if c not in INTRADAY_DTYPES]
+    if extra:
+        raise schema.SchemaError(f"intraday quotes has unknown columns: {extra}")
+    out = df.copy()
+    for col, dt in INTRADAY_DTYPES.items():
+        out[col] = out[col].astype(dt)
+    bad_right = ~out["right"].isin(["C", "P"])
+    if bad_right.any():
+        raise schema.SchemaError(f"{int(bad_right.sum())} intraday rows with right not in C/P")
+    if (out["bid"] < 0).any() or (out["ask"] < 0).any():
+        raise schema.SchemaError("negative intraday bid/ask")
+    crossed = out["bid"] > out["ask"]
+    if crossed.any():
+        raise schema.SchemaError(f"{int(crossed.sum())} crossed intraday quotes (bid > ask)")
+    return out[list(INTRADAY_DTYPES)]
+
+
+def _empty_intraday() -> pd.DataFrame:
+    return pd.DataFrame({c: pd.Series(dtype=t) for c, t in INTRADAY_DTYPES.items()})
 
 
 def _ym(d: date) -> tuple[int, int]:
@@ -63,6 +121,7 @@ class ChainStore:
     def __init__(self, root: str | Path = "data"):
         self.root = Path(root)
         self._con: duckdb.DuckDBPyConnection | None = None
+        self._intraday_avail_cache: dict[tuple[str, date], set[tuple]] = {}
 
     @property
     def con(self) -> duckdb.DuckDBPyConnection:
@@ -80,6 +139,14 @@ class ChainStore:
 
     def _underlying_path(self, root: str) -> Path:
         return self.root / "underlying" / f"{root}.parquet"
+
+    def _intraday_partition_path(self, root: str, quote_date: date) -> Path:
+        """One file per (root, calendar day) -- deliberately NOT per (root, month)
+        like the EOD chain partitions: pass 2 of the hybrid backtest only ever
+        needs one contract-day at a time (task brief -- "a single contract-day is
+        cheap to read"), and per-day files keep that read to exactly one small
+        file instead of a whole month's worth of every-contract minute bars."""
+        return self.root / "intraday" / f"underlying={root}" / f"date={quote_date.isoformat()}" / "part.parquet"
 
     def _partition_paths_for_range(self, root: str, start: date, end: date) -> list[Path]:
         paths = []
@@ -221,6 +288,70 @@ class ChainStore:
         if not rows:
             return pd.DataFrame(columns=["root", "min_date", "max_date", "n_rows", "n_expiries"])
         return pd.DataFrame(rows)
+
+    # -- intraday (1-minute quotes) -----------------------------------------------
+
+    def intraday(self, root: str, expiry: date, strike: float, right: str, quote_date: date) -> pd.DataFrame:
+        """One contract-day of 1-minute quotes, sorted by `ts`. Empty frame (never
+        an error) if this contract-day was never ingested -- callers (engine/loop.py,
+        engine/intraday.py) treat "no rows" as "fall back to EOD for this position on
+        this day" and record that fallback explicitly (task requirement)."""
+        path = self._intraday_partition_path(root, quote_date)
+        if not path.exists():
+            return _empty_intraday()
+        df = pd.read_parquet(path)
+        mask = (
+            np.isclose(df["strike"].astype(float), float(strike))
+            & (df["right"] == right)
+            & (pd.to_datetime(df["expiry"]) == pd.Timestamp(expiry))
+        )
+        out = df.loc[mask].sort_values("ts").reset_index(drop=True)
+        if out.empty:
+            return _empty_intraday()
+        return out[list(INTRADAY_DTYPES)]
+
+    def intraday_available_keys(self, root: str, quote_date: date) -> set[tuple[date, float, str]]:
+        """Distinct (expiry, strike, right) covered by this (root, quote_date)'s
+        intraday partition -- cheap existence index, cached per instance (perf: the
+        two-pass hybrid backtest calls this once per open position per day)."""
+        cache_key = (root, quote_date)
+        if cache_key in self._intraday_avail_cache:
+            return self._intraday_avail_cache[cache_key]
+        path = self._intraday_partition_path(root, quote_date)
+        if not path.exists():
+            keys: set[tuple[date, float, str]] = set()
+        else:
+            df = pd.read_parquet(path, columns=["expiry", "strike", "right"])
+            keys = {
+                ((e.date() if hasattr(e, "date") else e), float(s), str(r))
+                for e, s, r in zip(pd.to_datetime(df["expiry"]), df["strike"], df["right"])
+            }
+        self._intraday_avail_cache[cache_key] = keys
+        return keys
+
+    def has_intraday(self, root: str, expiry: date, strike: float, right: str, quote_date: date) -> bool:
+        return (expiry, float(strike), right) in self.intraday_available_keys(root, quote_date)
+
+    def write_intraday(self, df: pd.DataFrame) -> None:
+        """Merge-write 1-minute quotes, partitioned by (root, quote_date). Idempotent
+        like `write_chain`: dedupes on `_INTRADAY_KEY`, new rows win."""
+        if df.empty:
+            return
+        valid = _validate_intraday(df)
+        qd = pd.to_datetime(valid["quote_date"]).dt.date
+        for (root, d), part in valid.groupby([valid["root"], qd]):
+            path = self._intraday_partition_path(str(root), d)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                existing = pd.read_parquet(path)
+                merged = pd.concat([existing, part], ignore_index=True)
+            else:
+                merged = part
+            merged = merged.drop_duplicates(subset=_INTRADAY_KEY, keep="last")
+            merged = _validate_intraday(merged)
+            merged = merged.sort_values(["expiry", "strike", "right", "ts"]).reset_index(drop=True)
+            merged.to_parquet(path, index=False)
+            self._intraday_avail_cache.pop((str(root), d), None)
 
     def has_data(self, root: str) -> bool:
         if self._underlying_path(root).exists():

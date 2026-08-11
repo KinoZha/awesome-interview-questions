@@ -209,6 +209,7 @@ src/odds_lab/
     portfolio.py         cash, positions, equity, Reg-T margin approximation
     attribution.py       greek P&L decomposition per snapshot
     loop.py              daily event loop
+    intraday.py          intraday exit evaluation + two-pass hybrid backtest (§3.1)
   report/
     figures.py           plotly figures
     build.py             self-contained HTML report
@@ -223,7 +224,21 @@ Partitioned parquet, queried in place by DuckDB (no server, partition pruning):
 data/chains/underlying=SPY/year=2015/month=03/part.parquet
 data/underlying/SPY.parquet
 data/rates/dgs3mo.parquet
+data/intraday/underlying=SPY/date=2015-03-16/part.parquet
 ```
+
+`data/intraday/` (1-minute option QUOTES, STRATEGY.md §5.1) is partitioned by (root, calendar
+day), not (root, year, month) like the EOD chains: pass 2 of the hybrid backtest only ever
+needs one contract-day at a time, so per-day files keep that read to exactly one small file
+instead of a whole month's worth of every contract's minute bars. Contract is
+`data/store.py::INTRADAY_DTYPES` -- deliberately NOT part of `schema.py`'s cross-module
+contract (this feature's edit scope excludes `schema.py`; it follows the precedent
+`engine/loop.py::FUNNEL_DTYPES` already sets for a table that lives with the module that owns
+it). Written via `ChainStore.write_intraday`, read via `ChainStore.intraday`/
+`intraday_available_keys`. This table is expected to stay small: only the contract-days pass 1
+actually held (~1-2 GB per the sizing in STRATEGY.md §5.1), never a full chain's 1-minute
+history (~1.4 TB for SPY/QQQ/IWM x 12y at 289 MB/day/root -- that ingest is explicitly not
+built by this feature).
 
 Estimated ~30–55M rows / ~3–8 GB compressed for SPY+QQQ+IWM daily EOD chains 2012–2026.
 Partition by year+month (not day — too many small files). Row group size 128 MB.
@@ -244,8 +259,16 @@ Daily loop over trading dates. At each date:
 1. Load that date's chain slice for the active roots (DuckDB, columns pushed down).
 2. Mark existing positions to market (per-leg, at mid for MTM; at bid/ask only for fills).
 3. Evaluate exit policies → close triggered positions at the **next** snapshot (no lookahead).
+   **Intraday extension (`cfg.intraday.enabled`, §9, `engine/intraday.py`)**: when the store
+   has 1-minute quote coverage for every leg of a position on this date, this step evaluates
+   `profit_target`/`stop_loss`/`delta_breach` bar-by-bar instead of once at the close, and can
+   close the position that same day (fill on the bar *after* the trigger bar -- the daily
+   no-lookahead rule extended to minute granularity). Any position/day without full leg
+   coverage falls back to the EOD-only check, tracked explicitly (`manifest['intraday']`) so a
+   mixed-resolution run is never silent. `dte_exit` is unaffected -- always daily.
 4. Handle expirations: intrinsic settlement, assignment, spread exercise.
 5. If an entry is scheduled for this date, run the selector → construct legs → size → fill.
+   Entries are **always EOD** -- the intraday extension applies to exits only (§9).
 6. Record equity, margin usage, greek exposure, and a per-position attribution slice.
 
 Every fill produces a `Fill` record with `leg, qty, side, price, price_kind('bid'|'ask'|'mid'),
@@ -253,6 +276,43 @@ commission, fees, spread_cost_vs_mid`. Total slippage is therefore always decomp
 
 Position sizing per STRATEGY.md §6. Margin: defined-risk = max loss; undefined-risk =
 Reg-T approximation, tracked as a time series because that is the real failure mode.
+
+### 3.1 Intraday exits -- the two-pass hybrid and its feedback loop
+
+STRATEGY.md §5.1 has the full rule-level spec (which exits go intraday, the
+trigger-bar/fill-bar discipline, the delta-recompute approximation). This section
+is the implementation-level summary of the two decisions that matter architecturally:
+
+- **Why two passes, not a full 1-minute ingest**: a real ThetaData bulk 1-minute
+  QUOTE export is on the order of 289 MB/day for SPY alone; 12 years x 3 roots is
+  roughly 1.4 TB. Pass 1 (the unmodified EOD engine above) determines the held-
+  contract set (~1,200 trades x up to 4 legs x ~30 holding days); pass 2 only ever
+  needs 1-minute quotes for that set (~1-2 GB), read from `data/intraday/` (§2).
+- **Why iteration, not a one-shot superset, for the feedback loop**: an intraday
+  exit can move an exit date, which changes concurrent-position counts/margin
+  (§6 Position sizing), which can admit or reject different LATER entries, which
+  changes the held-contract set pass 2 needed data for in the first place. There is
+  no way to bound that drift in advance without re-running the backtest, so
+  `engine.intraday.run_hybrid_backtest` re-runs the full backtest and recomputes
+  the held-contract-day set each iteration, stopping when that set stops changing
+  AND every contract-day in it has intraday coverage (a true fixed point), capped
+  at `IntradayConfig.iteration_cap` (default 3). Hitting the cap without converging
+  is reported (`manifest['intraday']['hybrid']['converged'] = False`), never
+  silently treated as success. Whichever contract-days lack coverage on the final
+  iteration run EOD-only for that position/day, and the manifest states exactly
+  which (`manifest['intraday']['positions_evaluated_intraday']` /
+  `['positions_eod_fallback']`) -- a silently mixed-resolution backtest is worse
+  than a consistently EOD one.
+- **`engine.intraday.compare_eod_vs_intraday`** runs the identical config both ways
+  and reports, per exit rule, exits changed / exit-date shift / P&L delta -- the
+  number that actually justifies the 1-minute data purchase (STRATEGY.md §5.1).
+- **The 1-minute QUOTE export schema is UNVERIFIED**, unlike `option_eod`/
+  `option_ohlc_1m` (§0.5): `data/providers/csv_export.py::read_quote_1m_csv` is
+  header-driven and defensive for exactly this reason, classifying via the same
+  `data/probe.py::_classify` heuristic used for `option_quote_1m`/`option_quote_tick`
+  elsewhere, and raising a clear error naming the columns it found rather than
+  guessing a layout. Confirm it against a real export with `odds-lab probe --csv`
+  before trusting it operationally.
 
 ## 4. Attribution
 

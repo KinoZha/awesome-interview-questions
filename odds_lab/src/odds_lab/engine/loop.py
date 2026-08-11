@@ -4,6 +4,20 @@ Per trading date, in order: mark positions -> evaluate exits (trigger only) -> s
 expirations -> fill exits triggered on a PRIOR day (no lookahead, STRATEGY.md §7.3) ->
 record snapshots -> run entries if scheduled.
 
+Intraday exits (`cfg.intraday.enabled`, ARCHITECTURE.md §9 non-goal lifted for exits
+only, `engine/intraday.py`): when the store has 1-minute quote coverage for every leg
+of an open position on `asof`, the exit-evaluation step below hands off to
+`intraday.evaluate_intraday_day` instead of the single EOD snapshot check. A rule that
+triggers mid-day with a same-day next bar available fills and closes THAT SAME DAY,
+bypassing the day-after pending-exit path entirely; a rule triggering on the day's last
+bar defers to the normal next-day-EOD-fill path exactly as before. Any position/day
+without full leg coverage falls back to the EOD-only check unchanged. Every fallback is
+recorded (`manifest['intraday']`) so a mixed-resolution run is never silent -- see
+`run_hybrid_backtest`/`compare_eod_vs_intraday` in `engine/intraday.py` for the two-pass
+driver that actually assembles the intraday quote coverage this loop consumes. Default
+OFF (`IntradayConfig.enabled=False`): every pre-existing config runs byte-identical to
+before this feature existed.
+
 Early-assignment policy (STRATEGY.md §5/§7, judgement call -- see docstring on
 `_flag_early_assignment_risk`): DETECTED AND FLAGGED ONLY. Actual settlement always uses
 the documented intrinsic-value rule at expiry (or the configured exit policy pre-expiry);
@@ -25,6 +39,7 @@ from odds_lab import schema
 from odds_lab.config import BacktestConfig
 from odds_lab.engine import attribution as attribution_mod
 from odds_lab.engine import fills as fills_mod
+from odds_lab.engine import intraday as intraday_mod
 from odds_lab.engine.portfolio import Portfolio
 from odds_lab.engine.result import BacktestResult
 from odds_lab.schema import CONTRACT_MULTIPLIER, ExitReason, Position
@@ -317,6 +332,8 @@ def run_backtest(cfg: BacktestConfig, store) -> BacktestResult:
     funnel_records: list[dict] = []
     warnings: list[str] = []
     position_counter = 0
+    intraday_positions: set[str] = set()
+    intraday_fallback_positions: set[str] = set()
 
     all_dates: set[date] = set()
     for root in cfg.roots:
@@ -339,6 +356,7 @@ def run_backtest(cfg: BacktestConfig, store) -> BacktestResult:
         # 1. mark existing positions to market (mid)
         marks: dict[str, float] = {}
         mark_details: dict[str, dict] = {}
+        s_by_pos: dict[str, float] = {}
         for pos in portfolio.positions:
             if not pos.is_open:
                 continue
@@ -348,16 +366,50 @@ def run_backtest(cfg: BacktestConfig, store) -> BacktestResult:
             if detail is not None:
                 marks[pos.position_id] = detail["mark"]
                 mark_details[pos.position_id] = detail
+                if not chain.empty:
+                    s_by_pos[pos.position_id] = float(chain["underlying_price"].iloc[0])
 
         equity_val = portfolio.equity(marks)
 
-        # 2. evaluate exits -> trigger only (fills on the NEXT trading day, no lookahead)
+        # 2. evaluate exits -> trigger only (fills on the NEXT trading day, no lookahead) --
+        # OR, when cfg.intraday.enabled and 1-minute quotes cover every leg on `asof`,
+        # evaluate (and possibly fill, same day) at minute resolution instead. See module
+        # docstring + engine/intraday.py.
+        intraday_on = cfg.intraday.enabled and hasattr(store, "intraday")
         for pos in portfolio.positions:
             if not pos.is_open or pos.meta.get("_pending_exit"):
                 continue
             detail = mark_details.get(pos.position_id)
             if detail is None:
                 continue
+
+            merged = intraday_mod.bars_for_position(store, pos, asof) if intraday_on else None
+            if merged is not None and not merged.empty:
+                intraday_positions.add(pos.position_id)
+                ir = intraday_mod.evaluate_intraday_day(pos, merged, cfg, s_by_pos.get(pos.position_id), asof)
+                if ir.reason is not None:
+                    if ir.fill_ts is not None:
+                        # same-day trigger + same-day next-bar fill: close now,
+                        # bypassing the day-after pending-exit mechanism entirely.
+                        for f in ir.close_fills:
+                            portfolio.cash += f.cash
+                        pos.close_fills = ir.close_fills
+                        pos.exit_date = asof
+                        pos.exit_reason = ir.reason
+                        pos.meta["_underlying_exit"] = s_by_pos.get(pos.position_id, float("nan"))
+                        pos.meta["_intraday_trigger_ts"] = str(ir.trigger_ts)
+                        pos.meta["_intraday_fill_ts"] = str(ir.fill_ts)
+                    else:
+                        # triggered on the day's last bar -- no same-day next bar to
+                        # fill at; defer to the existing next-day EOD fill path.
+                        pos.meta["_pending_exit"] = ir.reason
+                        pos.meta["_pending_exit_trigger_date"] = asof
+                continue  # evaluated intraday this day either way -- do not also
+                          # run the daily check below on the same position/day
+
+            if intraday_on:
+                intraday_fallback_positions.add(pos.position_id)
+
             snap = {
                 "mark": detail["mark"], "short_delta": detail["short_delta"],
                 "dte": (pos.expiry - asof).days, "underlying_price": None,
@@ -591,6 +643,18 @@ def run_backtest(cfg: BacktestConfig, store) -> BacktestResult:
         "rejected_trades": portfolio.rejected_trades,
         "warnings": warnings,
         "selection_funnel": _aggregate_funnel(funnel_df),
+        "intraday": {
+            "enabled": cfg.intraday.enabled,
+            "exit_rules": list(cfg.intraday.exit_rules),
+            "n_positions_evaluated_intraday": len(intraday_positions),
+            "n_positions_eod_fallback": len(intraday_fallback_positions),
+            # position_ids (opaque within this run, but readable -- root-strategy-
+            # date-...) so a run report can state plainly which contracts got
+            # minute-resolution exits and which stayed EOD-only (task requirement:
+            # a silently mixed-resolution backtest is worse than a consistent one).
+            "positions_evaluated_intraday": sorted(intraday_positions),
+            "positions_eod_fallback": sorted(intraday_fallback_positions),
+        },
     }
 
     return BacktestResult(

@@ -121,6 +121,38 @@ class RiskConfig:
 
 
 @dataclass(frozen=True)
+class IntradayConfig:
+    """Hybrid two-pass intraday exit evaluation -- ARCHITECTURE.md §9 (lifts the
+    "no intraday in v1" non-goal), STRATEGY.md §5/§7.3. OFF by default so every
+    existing config/run is byte-identical to before this feature existed
+    (CLAUDE.md rule 5).
+
+    Entries stay EOD-only always (STRATEGY.md §4's weekly-entry schedule does not
+    need intraday timing, per this change's brief). Only exit evaluation for the
+    rules named in `exit_rules` gains minute resolution; `dte_exit` is excluded on
+    purpose (it is daily by nature, STRATEGY.md §5) and is always evaluated once/day
+    regardless of what's listed here -- see `engine/intraday.py`.
+    """
+
+    enabled: bool = False
+    provider: Literal["parquet", "csv_export"] = "parquet"
+    """Where 1-minute quotes come from for pass 2. 'parquet' reads whatever is
+    already in the store's intraday table (`data/store.py::ChainStore.intraday`);
+    'csv_export' additionally allows `engine.intraday.run_hybrid_backtest`'s
+    `fetch_fn` hook to ingest more via `data.providers.csv_export.read_quote_1m_csv`."""
+    source_path: str | None = None
+    """Directory of real ThetaData 1-minute QUOTE CSV exports, when provider='csv_export'."""
+    bar_interval_minutes: int = 1
+    exit_rules: tuple[str, ...] = ("profit_target", "stop_loss", "delta_breach")
+    """Which of ExitConfig's early-exit rules get intraday evaluation. `dte_exit`
+    must never appear here (engine/intraday.py masks it out even if it does)."""
+    iteration_cap: int = 3
+    """Max fixed-point iterations `engine.intraday.run_hybrid_backtest` will run
+    before giving up and reporting non-convergence (task requirement -- never
+    silently assume the held-contract-set feedback loop converged)."""
+
+
+@dataclass(frozen=True)
 class DataConfig:
     provider: Literal["thetadata", "parquet", "synthetic"] = "parquet"
     theta_base_url: str = "http://127.0.0.1:25503"
@@ -141,6 +173,7 @@ class BacktestConfig:
     costs: CostModel = field(default_factory=CostModel)
     empirical: EmpiricalConfig = field(default_factory=EmpiricalConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    intraday: IntradayConfig = field(default_factory=IntradayConfig)
     risk_free_rate: float = 0.02
     """Fallback flat rate; overridden per-date when a rate curve is present in the store."""
     label: str = ""
@@ -170,6 +203,7 @@ class BacktestConfig:
             costs=CostModel(**d.get("costs", {})),
             empirical=EmpiricalConfig(**d.get("empirical", {})),
             data=DataConfig(**d.get("data", {})),
+            intraday=IntradayConfig(**d.get("intraday", {})),
             risk_free_rate=float(d.get("risk_free_rate", 0.02)),
             label=str(d.get("label", "")),
         )
@@ -182,6 +216,7 @@ __all__ = [
     "EmpiricalConfig",
     "EntryConfig",
     "ExitConfig",
+    "IntradayConfig",
     "MarketFilter",
     "RiskConfig",
     "Strategy",

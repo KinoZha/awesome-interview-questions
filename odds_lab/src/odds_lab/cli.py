@@ -257,6 +257,60 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------------------
+# intraday-compare -- STRATEGY.md §5.1 / ARCHITECTURE.md §3.1
+# --------------------------------------------------------------------------------------
+
+
+def cmd_intraday_compare(args: argparse.Namespace) -> int:
+    """Run the same config EOD-only vs. intraday-hybrid and report the bias,
+    per exit rule -- the first-class deliverable this feature exists to produce
+    (STRATEGY.md §5.1), not a footnote on a regular backtest."""
+    import dataclasses
+    import json as json_mod
+
+    store_path = Path(args.store)
+    if not store_path.exists():
+        print(f"error: data store not found at '{store_path}' -- run 'odds-lab ingest' first", file=sys.stderr)
+        return 1
+
+    try:
+        cfg = _load_config(args)
+    except (FileNotFoundError, ValueError, TypeError) as e:
+        print(f"error: invalid config: {e}", file=sys.stderr)
+        return 1
+
+    intraday_overrides: dict[str, Any] = {"enabled": True}
+    if getattr(args, "iteration_cap", None) is not None:
+        intraday_overrides["iteration_cap"] = args.iteration_cap
+    cfg = dataclasses.replace(cfg, intraday=dataclasses.replace(cfg.intraday, **intraday_overrides))
+
+    try:
+        from odds_lab.data.store import ChainStore
+        from odds_lab.engine.intraday import compare_eod_vs_intraday
+    except ImportError as e:
+        print(f"error: engine not available yet: {e}", file=sys.stderr)
+        return 1
+
+    store = ChainStore(store_path)
+    try:
+        comparison = compare_eod_vs_intraday(cfg, store, iteration_cap=args.iteration_cap)
+    except Exception as e:
+        print(f"error: intraday comparison failed: {e}", file=sys.stderr)
+        return 1
+
+    out_dir = Path(args.out) if args.out else cfg.run_dir() / "intraday-compare"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary = {"overall": comparison["overall"], "by_rule": comparison["by_rule"]}
+    (out_dir / "comparison.json").write_text(json_mod.dumps(summary, indent=2, sort_keys=True, default=str))
+    comparison["eod_result"].save(out_dir / "eod")
+    comparison["hybrid_result"].save(out_dir / "hybrid")
+
+    print(json_mod.dumps(summary, indent=2, sort_keys=True, default=str))
+    print(f"wrote {out_dir}")
+    return 0
+
+
+# --------------------------------------------------------------------------------------
 # sweep
 # --------------------------------------------------------------------------------------
 
@@ -341,6 +395,101 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / "comparison.html"
     _write_comparison_report(results, report_path)
+    print(f"wrote {report_path}")
+    return 0
+
+
+# --------------------------------------------------------------------------------------
+# stress
+# --------------------------------------------------------------------------------------
+
+
+def cmd_stress(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run)
+    if not run_dir.exists():
+        print(f"error: run directory not found: {run_dir}", file=sys.stderr)
+        return 1
+    history_path = Path(args.underlying_history)
+    if not history_path.exists():
+        print(f"error: underlying history file not found: {history_path}", file=sys.stderr)
+        return 1
+
+    try:
+        from odds_lab.engine.result import BacktestResult
+        from odds_lab.engine import stress as stress_mod
+    except ImportError as e:
+        print(f"error: engine not available yet: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        result = BacktestResult.load(run_dir)
+    except Exception as e:
+        print(f"error: failed to load run from '{run_dir}': {e}", file=sys.stderr)
+        return 1
+
+    try:
+        closes = stress_mod.load_underlying_history(history_path)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    names = [s.strip() for s in args.scenarios.split(",") if s.strip()] if args.scenarios else None
+    scenarios = stress_mod.build_scenarios(closes, names)
+    if not scenarios.scenarios:
+        print(
+            "warning: no scenarios could be built from the supplied history "
+            f"(skipped: {scenarios.skipped})", file=sys.stderr,
+        )
+
+    stress_result = stress_mod.run_stress(result.trades, scenarios, result.config.exits)
+    stress_out = stress_result.save(run_dir)
+    print(f"wrote {stress_out}")
+
+    long_history_edge = None
+    if args.store:
+        store_path = Path(args.store)
+        if not store_path.exists():
+            print(f"warning: --store '{store_path}' not found -- skipping the long-window edge comparison", file=sys.stderr)
+        else:
+            from odds_lab.data.store import ChainStore
+
+            store = ChainStore(store_path)
+            long_closes = {root: closes for root in result.config.roots}
+            try:
+                _short, _long, long_history_edge = stress_mod.run_backtest_with_long_history(
+                    result.config, store, long_closes
+                )
+            except Exception as e:
+                print(f"warning: long-window edge comparison failed: {e}", file=sys.stderr)
+
+    odds_overlay_figs = []
+    from odds_lab.report import figures as F
+
+    trades = result.trades
+    if not trades.empty and scenarios.scenarios:
+        for root in sorted(trades["root"].dropna().unique()):
+            sub = trades[trades["root"] == root]
+            horizon = int(round(sub["dte_entry"].median())) if sub["dte_entry"].notna().any() else 30
+            iv = float(sub["iv_entry"].median()) if sub["iv_entry"].notna().any() else 0.20
+            strikes = sorted(set(sub["short_strike"].dropna().tolist()))
+            asof = closes.index.max()
+            fig = F.fig_stress_odds_overlay(closes, horizon, iv, asof, scenarios.scenarios, strikes=strikes)
+            odds_overlay_figs.append((f"{root} ODDS chart with crisis overlays", fig))
+
+    from odds_lab.report.build import build_report
+
+    report_path = build_report(
+        result, run_dir / "report.html",
+        extra={
+            "stress": {
+                "comparisons": stress_result.comparisons,
+                "beta_sensitivity": stress_result.beta_sensitivity,
+                "skipped": scenarios.skipped,
+                "long_history_edge": long_history_edge,
+                "odds_overlay_figs": odds_overlay_figs,
+            }
+        },
+    )
     print(f"wrote {report_path}")
     return 0
 
@@ -435,12 +584,54 @@ def _build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--out", default=None)
     p_bt.set_defaults(func=cmd_backtest)
 
+    p_ic = sub.add_parser(
+        "intraday-compare",
+        help="run a config EOD-only vs. intraday-hybrid and report the exit-timing/P&L bias per rule",
+    )
+    p_ic.add_argument("--config", default=None, help="config.yaml; flags below override it")
+    p_ic.add_argument("--roots", default=None, help="comma-separated, e.g. SPY,QQQ,IWM")
+    p_ic.add_argument("--start", default=None, help="YYYY-MM-DD")
+    p_ic.add_argument("--end", default=None, help="YYYY-MM-DD")
+    p_ic.add_argument("--strategy", default=None)
+    p_ic.add_argument("--strike-rule", dest="strike_rule", default=None)
+    p_ic.add_argument("--delta-min", dest="delta_min", type=float, default=None)
+    p_ic.add_argument("--delta-max", dest="delta_max", type=float, default=None)
+    p_ic.add_argument("--width", type=int, default=None)
+    p_ic.add_argument("--dte-min", dest="dte_min", type=int, default=None)
+    p_ic.add_argument("--dte-max", dest="dte_max", type=int, default=None)
+    p_ic.add_argument("--profit-target", dest="profit_target", type=float, default=None)
+    p_ic.add_argument("--stop-loss", dest="stop_loss", type=float, default=None)
+    p_ic.add_argument("--iteration-cap", dest="iteration_cap", type=int, default=None, help="feedback-loop fixed-point cap (default: config's IntradayConfig.iteration_cap)")
+    p_ic.add_argument("--store", required=True, help="store containing BOTH the EOD chains and data/intraday/ coverage")
+    p_ic.add_argument("--out", default=None)
+    p_ic.set_defaults(func=cmd_intraday_compare)
+
     p_sweep = sub.add_parser("sweep", help="cartesian-product parameter sweep + comparison report")
     p_sweep.add_argument("--config", required=True)
     p_sweep.add_argument("--grid", required=True)
     p_sweep.add_argument("--store", default=None)
     p_sweep.add_argument("--out", default=None)
     p_sweep.set_defaults(func=cmd_sweep)
+
+    p_stress = sub.add_parser(
+        "stress", help="crisis stress-test a saved run's positions against realized underlying paths"
+    )
+    p_stress.add_argument("--run", required=True, help="run directory (as written by 'odds-lab backtest')")
+    p_stress.add_argument(
+        "--underlying-history", dest="underlying_history", required=True,
+        help="CSV with 'date' and 'close' columns, long enough to cover the scenarios requested "
+        "(see docs/STRATEGY.md §10.1 for free sources)",
+    )
+    p_stress.add_argument(
+        "--scenarios", default=None,
+        help="comma-separated scenario names (default: the full library, STRATEGY.md §10.1)",
+    )
+    p_stress.add_argument(
+        "--store", default=None,
+        help="optional data store, to also re-run the backtest with the empirical distribution "
+        "fed from --underlying-history (STRATEGY.md §10.4); skipped if omitted",
+    )
+    p_stress.set_defaults(func=cmd_stress)
 
     p_report = sub.add_parser("report", help="rebuild report.html from a saved run")
     p_report.add_argument("--run", required=True)

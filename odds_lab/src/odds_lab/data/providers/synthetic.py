@@ -198,6 +198,31 @@ def _round_to_tick(price: np.ndarray, tick: np.ndarray, mode: str) -> np.ndarray
     return n * tick
 
 
+def _minute_bridge(rng: np.random.Generator, s_open: float, s_close: float, n_bars: int, vol_scale: float = 0.15) -> np.ndarray:
+    """Deterministic Brownian-bridge intraday path, anchored to hit `s_close`
+    exactly at the last bar -- the day's open/close discipline must match the
+    already-generated EOD chain for the same (root, quote_date) exactly, since
+    both are consumed by the same backtest run. Intraday-exit tests that need an
+    exact shape (e.g. a spike that reverts by the close) pass `s_path` explicitly
+    to `SyntheticProvider.intraday_quotes` instead of using this default."""
+    n_bars = max(int(n_bars), 1)
+    log_open, log_close = np.log(max(s_open, 1e-6)), np.log(max(s_close, 1e-6))
+    t = np.arange(1, n_bars + 1) / n_bars
+    drift = log_open + t * (log_close - log_open)
+    noise = rng.normal(0.0, vol_scale / np.sqrt(n_bars), n_bars)
+    noise_cum = np.cumsum(noise)
+    # subtract off the endpoint's cumulative noise, scaled by t, so the bridge lands
+    # exactly on log_close at t=1 (standard Brownian-bridge construction).
+    bridge_noise = noise_cum - t * noise_cum[-1]
+    return np.exp(drift + bridge_noise)
+
+
+def _empty_intraday_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=["root", "expiry", "strike", "right", "quote_date", "ts", "bid", "ask", "bid_size", "ask_size", "source", "is_synthetic"]
+    )
+
+
 class SyntheticProvider(ChainProvider):
     """Generates a full arbitrage-consistent chain over [start, end] for `roots`,
     deterministic given `seed`. See module docstring."""
@@ -343,6 +368,83 @@ class SyntheticProvider(ChainProvider):
         # right dtype, so it would pass strict=False unchanged. `ingest.py` validates
         # (via write_chain) once per batch instead of once per expiry.
         return pd.concat(frames, ignore_index=True)
+
+    # -- intraday (1-minute quotes) ---------------------------------------------
+    # Extends this generator for the intraday-exit feature only -- chain_eod/
+    # underlying_eod above are untouched, per that change's scope.
+
+    def intraday_quotes(
+        self,
+        root: str,
+        quote_date: date,
+        expiry: date,
+        strike: float,
+        right: str,
+        n_bars: int = 390,
+        s_path: "np.ndarray | Sequence[float] | None" = None,
+    ) -> pd.DataFrame:
+        """One synthetic contract-day of 1-minute quotes, BS-repriced bar-by-bar off
+        an intraday underlying path, in `data/store.py::INTRADAY_DTYPES` shape.
+
+        `s_path`: optional explicit length-`n_bars` array of underlying prices for
+        the day -- lets a test construct an exact path (e.g. a spike that reverts by
+        the close, the specific bias `docs/STRATEGY.md`/this feature exists to
+        measure) instead of the default deterministic Brownian bridge between the
+        day's already-generated EOD open and close.
+        """
+        under = self._underlying.get(root)
+        if under is None:
+            raise ValueError(f"synthetic provider was not built for root {root!r}")
+        row = under.loc[under["date"] == pd.Timestamp(quote_date)]
+        if row.empty:
+            return _empty_intraday_frame()
+        regime = int(row["_regime"].iloc[0])
+        params = _ROOT_PARAMS.get(root, _DEFAULT_PARAMS)
+        q = params["div_yield"]
+        r = 0.02
+
+        if s_path is None:
+            rng = np.random.default_rng(_day_seed(self.seed, root, quote_date) ^ zlib.crc32(f"{strike}-{right}".encode()))
+            s_open, s_close = float(row["open"].iloc[0]), float(row["close"].iloc[0])
+            s_arr = _minute_bridge(rng, s_open, s_close, n_bars)
+        else:
+            s_arr = np.asarray(s_path, dtype=float)
+            n_bars = len(s_arr)
+        if n_bars <= 0:
+            return _empty_intraday_frame()
+
+        dte = (expiry - quote_date).days
+        if dte <= 0:
+            return _empty_intraday_frame()
+        # time remaining ticks down across the day's bars too, not just day-to-day.
+        T = np.maximum((dte - np.arange(n_bars) / n_bars) / 365.0, 1e-6)
+        K = np.full(n_bars, float(strike))
+        right_arr = np.full(n_bars, right, dtype=object)
+
+        iv = _smile_iv(K, s_arr, T, regime)
+        from odds_lab.quant.bs import bs_price
+
+        theo = bs_price(s_arr, K, T, r, q, iv, right_arr)
+
+        otm_amt = np.where(right == "C", np.maximum(K - s_arr, 0.0), np.maximum(s_arr - K, 0.0)) / np.maximum(s_arr, 1e-6)
+        spread_frac = np.clip(0.02 + 0.35 * otm_amt + 0.04 / np.maximum(theo, 0.05), 0.02, 0.9)
+        half_spread = np.maximum(theo * spread_frac / 2.0, 0.005)
+        tick = _tick(theo)
+        bid = np.maximum(_round_to_tick(np.maximum(theo - half_spread, 0.0), tick, "down"), 0.0)
+        ask = np.maximum(_round_to_tick(theo + half_spread, tick, "up"), bid + tick)
+
+        minutes = pd.date_range(
+            pd.Timestamp(quote_date) + pd.Timedelta(hours=9, minutes=30), periods=n_bars, freq="1min"
+        )
+        return pd.DataFrame(
+            {
+                "root": root, "expiry": pd.Timestamp(expiry), "strike": float(strike), "right": right,
+                "quote_date": pd.Timestamp(quote_date), "ts": minutes,
+                "bid": bid, "ask": ask,
+                "bid_size": np.full(n_bars, 10, dtype=np.int32), "ask_size": np.full(n_bars, 10, dtype=np.int32),
+                "source": "synthetic", "is_synthetic": True,
+            }
+        )
 
 
 def make_sample_store(
